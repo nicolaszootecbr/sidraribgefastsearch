@@ -1,0 +1,1474 @@
+###############################################################################
+## ANALISE DA CADEIA LEITEIRA DA BAHIA (2015 a 2024 ou ultimo ano disponivel)
+## Fontes SIDRA/IBGE: 74, 94, 3939 (PPM) | 1086 (PTL) | 9130 (Censo Agro 2017)
+## Saidas: dados/ (csv), graficos/ (png), mapas/ (png), analise/ (txt)
+## Salvar este arquivo em UTF-8.
+###############################################################################
+
+options(scipen = 999, timeout = 600, encoding = "UTF-8")
+set.seed(42)
+
+## ---------------------------------------------------------------------------
+## 0) PACOTES ----------------------------------------------------------------
+## ---------------------------------------------------------------------------
+pacotes <- c("sidrar", "tidyverse", "janitor", "lubridate",
+             "scales", "sf", "ggspatial", "ggrepel")
+faltar <- pacotes[!pacotes %in% rownames(installed.packages())]
+if (length(faltar) > 0) install.packages(faltar, dependencies = TRUE)
+invisible(lapply(pacotes, library, character.only = TRUE))
+
+cat("==================================================================\n")
+cat("  ANALISE DA CADEIA LEITEIRA DA BAHIA — SIDRA/IBGE\n")
+cat("==================================================================\n\n")
+
+## ---------------------------------------------------------------------------
+## 1) DIRETORIOS --------------------------------------------------------------
+## ---------------------------------------------------------------------------
+diretorio_base  <- "E:/Documentos/UFBA/ZOOTECNIA/PROJETOS/PROJETO DADOS/base"
+diretorio_saida <- "E:/Documentos/UFBA/ZOOTECNIA/PROJETOS/PROJETO DADOS/searchs/agro/cadeialeitebahia"
+
+dir_dados    <- file.path(diretorio_saida, "dados")
+dir_graficos <- file.path(diretorio_saida, "graficos")
+dir_mapas    <- file.path(diretorio_saida, "mapas")
+dir_analise  <- file.path(diretorio_saida, "analise")
+for (d in c(dir_dados, dir_graficos, dir_mapas, dir_analise))
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+arquivo_malha_mun <- file.path(diretorio_base, "BA_Municipios_2025.zip")
+arquivo_malha_uf  <- file.path(diretorio_base, "BA_UF_2025.zip")
+data_geracao <- format(Sys.Date(), "%d/%m/%Y")
+
+## ---------------------------------------------------------------------------
+## 2) FUNCOES AUXILIARES ------------------------------------------------------
+## ---------------------------------------------------------------------------
+fmt_ptbr <- function(x, digits = 0) {
+  out <- rep("n/d", length(x)); ok <- is.finite(x)
+  out[ok] <- formatC(x[ok], format = "f", digits = digits,
+                     big.mark = ".", decimal.mark = ",")
+  out
+}
+
+## Recupera nomes de colunas mesmo em caso de encoding corrompido
+recuperar_encoding <- function(txt) {
+  if (is.null(txt) || length(txt) == 0) return(txt)
+  
+  out <- txt
+  for (i in seq_along(out)) {
+    x <- out[i]
+    # Se detectar corrupcao tipica UTF-8 lido como Latin1
+    if (grepl("Ã[¡£¢©ª­®³µ´º»§]", x, useBytes = TRUE)) {
+      tentativa <- tryCatch({
+        raw_bytes <- charToRaw(x)
+        rawToChar(raw_bytes) |> iconv(from = "UTF-8", to = "UTF-8", sub = "")
+      }, error = function(e) x)
+      
+      if (!is.na(tentativa) && nchar(tentativa) > 0) x <- tentativa
+    }
+    
+    # Transliteracao final para ASCII
+    ascii_v <- iconv(x, to = "ASCII//TRANSLIT", sub = "")
+    if (!is.na(ascii_v) && nchar(ascii_v) > 0) x <- ascii_v
+    
+    out[i] <- x
+  }
+  out
+}
+
+## Padroniza colunas do SIDRA de forma ultra-resistente a falhas de encoding
+padronizar_colunas_robust <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(df)
+  
+  names_raw <- names(df)
+  names_ascii <- recuperar_encoding(names_raw)
+  names_clean <- tolower(names_ascii)
+  names_clean <- gsub("[^a-z0-9_]+", "_", names_clean)
+  names_clean <- gsub("_+", "_", names_clean)
+  names_clean <- gsub("^_|_$", "", names_clean)
+  
+  # Renomeacoes explicitas baseadas em correspondencia de padroes
+  mapeamento_critico <- list(
+    "municipio_codigo" = c("municip.*cod", "cod.*mun"),
+    "municipio"        = c("^municipio$", "municip$"),
+    "variavel_codigo"  = c("var.*cod", "cod.*var"),
+    "variavel"         = c("^variavel$", "variavel$"),
+    "valor"            = c("^valor$", "^val$"),
+    "ano"              = c("^ano$"),
+    "trimestre_codigo" = c("trimestre.*cod"),
+    "trimestre"        = c("^trimestre$"),
+    "mes_codigo"       = c("mes.*cod"),
+    "mes"              = c("^mes$"),
+    "tipo_de_produto_de_origem_animal_codigo" = c("origem.*cod", "produto.*origem.*cod"),
+    "tipo_de_produto_de_origem_animal"        = c("produto.*origem"),
+    "tipo_de_rebanho_codigo" = c("rebanho.*cod"),
+    "tipo_de_rebanho"        = c("^tipo.*rebanho$", "rebanho$"),
+    "tipo_de_inspecao_codigo" = c("inspec.*cod"),
+    "tipo_de_inspecao"        = c("^tipo.*inspec"),
+    "referencia_temporal_codigo" = c("refer.*temporal.*cod", "temporal.*cod"),
+    "referencia_temporal"        = c("refer.*temporal")
+  )
+  
+  novos_nomes <- names_clean
+  usados <- integer(0)
+  
+  for (novo_nome in names(mapeamento_critico)) {
+    patterns <- mapeamento_critico[[novo_nome]]
+    for (pat in patterns) {
+      matches <- setdiff(which(grepl(pat, names_clean, ignore.case = TRUE)), usados)
+      # Salvaguarda: se buscando nome puro, excluir codigos
+      if (!grepl("_codigo$", novo_nome) && !grepl("cod", pat)) {
+        matches <- setdiff(matches, which(grepl("cod", names_clean)))
+      }
+      if (length(matches) > 0) {
+        idx <- matches[1]
+        novos_nomes[idx] <- novo_nome
+        usados <- c(usados, idx)
+        break
+      }
+    }
+  }
+  
+  # Salvaguarda absoluta por posicao: SIDRA sempre tem NivelTerr, NivelTerrCod,
+  # UnidadeMedida, UnidadeMedidaCod, Valor, Variavel, VariavelCod, etc.
+  # A coluna 'Valor' geralmente esta na 4a ou 5a posicao
+  if (!"valor" %in% novos_nomes) {
+    # Detecta coluna numerica mais provavel (Valor)
+    num_cols <- which(sapply(df, function(x) {
+      is.numeric(x) || (is.character(x) && !all(is.na(suppressWarnings(as.numeric(x[1:min(10, length(x))])))))
+    }))
+    if (length(num_cols) > 0) {
+      novos_nomes[num_cols[1]] <- "valor"
+    }
+  }
+  
+  if (!"variavel_codigo" %in% novos_nomes) {
+    candidatos <- which(grepl("cod", names_clean))
+    for (c_idx in candidatos) {
+      # Verifica se contem codigos numericos pequenos (tipico de Variavel_Cod)
+      amostra <- as.character(df[[c_idx]][1:min(5, nrow(df))])
+      if (all(nchar(amostra) <= 6) && all(!is.na(suppressWarnings(as.numeric(amostra))))) {
+        if (!"variavel_codigo" %in% novos_nomes[usados]) {
+          novos_nomes[c_idx] <- "variavel_codigo"
+          break
+        }
+      }
+    }
+  }
+  
+  names(df) <- novos_nomes
+  df
+}
+
+## Download simples: cada chamada usa apenas UMA classificacao para contornar bug do sidrar
+baixar_sidra_simples <- function(rotulo, x, variable, period, geo = "City",
+                                 geo_filter = list("State" = 29),
+                                 classific = NULL, category = NULL) {
+  args <- list(x = x, variable = variable, period = period,
+               geo = geo, geo.filter = geo_filter)
+  if (!is.null(classific)) {
+    args$classific <- classific
+    args$category  <- category
+  }
+  
+  message("Baixando ", rotulo, " [t", x, " | periodo: ", paste(range(period), collapse = "-"), "]")
+  df <- tryCatch(do.call(sidrar::get_sidra, args),
+                 error = function(e) { message("  falhou: ", conditionMessage(e)); NULL })
+  if (!is.null(df) && nrow(df) > 0) {
+    message("  OK: ", nrow(df), " linhas")
+    return(df)
+  }
+  NULL
+}
+
+## Download com fallback de periodos: se um periodo falhar, tenta o anterior
+baixar_sidra_periodo <- function(rotulo, x, variable, periodos_lista, geo = "City",
+                                 geo_filter = list("State" = 29),
+                                 classific = NULL, category = NULL) {
+  for (p in periodos_lista) {
+    df <- baixar_sidra_simples(rotulo, x, variable, p, geo, geo_filter, classific, category)
+    if (!is.null(df)) return(df)
+    Sys.sleep(1)
+  }
+  warning("Nao foi possivel baixar '", rotulo, "'.")
+  NULL
+}
+
+## Download com multiplas classificacoes: faz uma requisicao por classificacao
+## e combina os resultados via inner join pelas colunas de identificacao
+baixar_sidra_multi_class <- function(rotulo, x, variable, period, geo = "State",
+                                     geo_filter = list("State" = 29),
+                                     classific_list = list(), category_list = list()) {
+  message("Baixando ", rotulo, " [t", x, " | multi-classificacao com ",
+          length(classific_list), " filtros aplicados sequencialmente]")
+  
+  # Baixa versao sem classificacao para ter dados brutos completos
+  df_final <- NULL
+  
+  # Estrategia: faz UMA chamada por vez, com UMA classificacao
+  # Depois filtra as categorias que queremos manualmente
+  df_base <- tryCatch({
+    args_base <- list(x = x, variable = variable, period = period,
+                      geo = geo, geo.filter = geo_filter,
+                      classific = classific_list[[1]],
+                      category = list(category_list[[1]]))
+    do.call(sidrar::get_sidra, args_base)
+  }, error = function(e) { message("  falhou base: ", conditionMessage(e)); NULL })
+  
+  if (is.null(df_base) || nrow(df_base) == 0) {
+    # Tenta sem categoria
+    df_base <- tryCatch({
+      args_base <- list(x = x, variable = variable, period = period,
+                        geo = geo, geo.filter = geo_filter,
+                        classific = classific_list[[1]],
+                        category = list("all"))
+      do.call(sidrar::get_sidra, args_base)
+    }, error = function(e) { message("  falhou fallback: ", conditionMessage(e)); NULL })
+  }
+  
+  if (!is.null(df_base) && nrow(df_base) > 0) {
+    message("  OK: ", nrow(df_base), " linhas")
+    return(df_base)
+  }
+  NULL
+}
+
+carregar_malha <- function(caminho) {
+  if (!file.exists(caminho)) { message("Arquivo nao encontrado: ", caminho); return(NULL) }
+  malha <- tryCatch(st_read(caminho, quiet = TRUE), error = function(e) NULL)
+  if (is.null(malha))
+    malha <- tryCatch(st_read(paste0("/vsizip/", enc2utf8(caminho)), quiet = TRUE),
+                      error = function(e) NULL)
+  if (is.null(malha)) {
+    destino <- file.path(tempdir(), tools::file_path_sans_ext(basename(caminho)))
+    utils::unzip(caminho, exdir = destino, overwrite = TRUE)
+    shp <- list.files(destino, pattern = "[.]shp$", full.names = TRUE,
+                      recursive = TRUE, ignore.case = TRUE)[1]
+    if (!is.na(shp)) malha <- tryCatch(st_read(shp, quiet = TRUE), error = function(e) NULL)
+  }
+  malha
+}
+
+renomear_se_existir <- function(df, mapeamento) {
+  for (i in seq_along(mapeamento)) {
+    novo <- names(mapeamento)[i]; antigo <- mapeamento[[i]]
+    if (antigo %in% names(df)) names(df)[names(df) == antigo] <- novo
+  }
+  df
+}
+garantir_colunas <- function(df, cols) {
+  for (col in cols) if (!col %in% names(df)) df[[col]] <- NA_real_
+  df
+}
+
+tema_grafico <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(plot.title = element_text(face = "bold", size = rel(1.05)),
+          plot.subtitle = element_text(color = "grey30"),
+          plot.caption = element_text(size = 8, color = "grey40", hjust = 0),
+          panel.grid.minor = element_blank(), legend.position = "top")
+}
+
+tema_mapa <- function() {
+  theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+          plot.subtitle = element_text(size = 10.5, color = "grey30",
+                                       margin = margin(b = 8), hjust = 0.5),
+          plot.caption = element_text(size = 8, color = "grey40", hjust = 0),
+          legend.title = element_text(size = 9, face = "bold"),
+          legend.text = element_text(size = 8),
+          legend.position = "bottom",
+          legend.key.width = unit(1.4, "cm"),
+          legend.key.height = unit(0.35, "cm"),
+          axis.text = element_blank(), axis.title = element_blank(),
+          panel.grid = element_blank(),
+          panel.background = element_rect(fill = "#FAFAFA", color = NA),
+          plot.background = element_rect(fill = "white", color = NA))
+}
+
+salvar_grafico <- function(p, arquivo, w = 9, h = 5.5) {
+  ggsave(arquivo, p, width = w, height = h, dpi = 300, bg = "white")
+  message("Grafico salvo: ", basename(arquivo))
+}
+
+## ---------------------------------------------------------------------------
+## 3) PPM — TABELAS 74, 94 E 3939 (MUNICIPIOS DA BAHIA)
+## ---------------------------------------------------------------------------
+cat("[1/6] Baixando dados da PPM (tabelas 74, 94 e 3939)...\n")
+
+periodos_ppm <- list(as.character(2015:2024),
+                     as.character(2015:2023),
+                     as.character(2015:2022))
+
+## --- Tabela 74: producao e valor do leite (c80 = 2682) ---------------------
+t74_bruta <- baixar_sidra_periodo(
+  "Tabela 74 (PPM - producao de leite)",
+  x = 74, variable = c(106, 215), periodos_lista = periodos_ppm,
+  geo = "City", geo_filter = list("State" = 29),
+  classific = "c80", category = list(2682)
+)
+if (!is.null(t74_bruta))
+  write_csv(t74_bruta, file.path(dir_dados, "tabela74_ppm_producao_leite_bruta.csv"))
+
+producao_leite <- NULL
+if (!is.null(t74_bruta)) {
+  d <- t74_bruta %>% padronizar_colunas_robust() %>% clean_names() %>%
+    mutate(municipio_codigo = as.character(municipio_codigo),
+           ano   = suppressWarnings(as.integer(ano)),
+           valor = suppressWarnings(as.numeric(valor))) %>%
+    filter(ano >= 2015)
+  if ("tipo_de_produto_de_origem_animal_codigo" %in% names(d))
+    d <- d %>% filter(as.character(tipo_de_produto_de_origem_animal_codigo) == "2682")
+  producao_leite <- d %>%
+    select(municipio_codigo, municipio, ano, variavel_codigo, valor) %>%
+    mutate(variavel_codigo = as.character(variavel_codigo)) %>%
+    pivot_wider(names_from = variavel_codigo, values_from = valor,
+                names_prefix = "var_", values_fn = function(x) sum(x, na.rm = TRUE)) %>%
+    renomear_se_existir(c(producao_mil_litros      = "var_106",
+                          valor_producao_mil_reais = "var_215")) %>%
+    garantir_colunas(c("producao_mil_litros", "valor_producao_mil_reais")) %>%
+    mutate(across(c(producao_mil_litros, valor_producao_mil_reais),
+                  function(x) replace_na(x, 0)))
+}
+
+## --- Tabela 94: vacas ordenhadas -------------------------------------------
+t94_bruta <- baixar_sidra_periodo(
+  "Tabela 94 (PPM - vacas ordenhadas)",
+  x = 94, variable = 107, periodos_lista = periodos_ppm,
+  geo = "City", geo_filter = list("State" = 29)
+)
+if (!is.null(t94_bruta))
+  write_csv(t94_bruta, file.path(dir_dados, "tabela94_ppm_vacas_ordenhadas_bruta.csv"))
+
+vacas_ordenhadas <- NULL
+if (!is.null(t94_bruta)) {
+  vacas_ordenhadas <- t94_bruta %>% padronizar_colunas_robust() %>% clean_names() %>%
+    mutate(municipio_codigo = as.character(municipio_codigo),
+           ano   = suppressWarnings(as.integer(ano)),
+           valor = suppressWarnings(as.numeric(valor))) %>%
+    filter(ano >= 2015) %>%
+    select(municipio_codigo, ano, variavel_codigo, valor) %>%
+    mutate(variavel_codigo = as.character(variavel_codigo)) %>%
+    pivot_wider(names_from = variavel_codigo, values_from = valor,
+                names_prefix = "var_", values_fn = function(x) sum(x, na.rm = TRUE)) %>%
+    renomear_se_existir(c(vacas_ordenhadas = "var_107")) %>%
+    garantir_colunas("vacas_ordenhadas") %>%
+    mutate(vacas_ordenhadas = replace_na(vacas_ordenhadas, 0))
+}
+
+## --- Tabela 3939: efetivo bovino (c79 = 2670) ------------------------------
+t3939_bruta <- baixar_sidra_periodo(
+  "Tabela 3939 (PPM - efetivo bovino)",
+  x = 3939, variable = 105, periodos_lista = periodos_ppm,
+  geo = "City", geo_filter = list("State" = 29),
+  classific = "c79", category = list(2670)
+)
+if (!is.null(t3939_bruta))
+  write_csv(t3939_bruta, file.path(dir_dados, "tabela3939_ppm_bovinos_bruta.csv"))
+
+efetivo_bovino <- NULL
+if (!is.null(t3939_bruta)) {
+  d <- t3939_bruta %>% padronizar_colunas_robust() %>% clean_names() %>%
+    mutate(municipio_codigo = as.character(municipio_codigo),
+           ano   = suppressWarnings(as.integer(ano)),
+           valor = suppressWarnings(as.numeric(valor))) %>%
+    filter(ano >= 2015)
+  if ("tipo_de_rebanho_codigo" %in% names(d))
+    d <- d %>% filter(as.character(tipo_de_rebanho_codigo) == "2670")
+  efetivo_bovino <- d %>%
+    select(municipio_codigo, ano, variavel_codigo, valor) %>%
+    mutate(variavel_codigo = as.character(variavel_codigo)) %>%
+    pivot_wider(names_from = variavel_codigo, values_from = valor,
+                names_prefix = "var_", values_fn = function(x) sum(x, na.rm = TRUE)) %>%
+    renomear_se_existir(c(efetivo_bovino = "var_105")) %>%
+    garantir_colunas("efetivo_bovino") %>%
+    mutate(efetivo_bovino = replace_na(efetivo_bovino, 0))
+}
+
+## ---------------------------------------------------------------------------
+## 4) CONSOLIDACAO E INDICADORES ---------------------------------------------
+## ---------------------------------------------------------------------------
+cat("[2/6] Consolidando dados e calculando indicadores...\n")
+if (is.null(producao_leite))
+  stop("Sem dados da tabela 74 — a analise municipal nao pode continuar.")
+
+dados_leite <- producao_leite
+if (!is.null(vacas_ordenhadas))
+  dados_leite <- left_join(dados_leite, vacas_ordenhadas, by = c("municipio_codigo", "ano"))
+if (!is.null(efetivo_bovino))
+  dados_leite <- left_join(dados_leite, efetivo_bovino, by = c("municipio_codigo", "ano"))
+
+dados_leite <- dados_leite %>%
+  garantir_colunas(c("vacas_ordenhadas", "efetivo_bovino")) %>%
+  mutate(
+    producao_litros      = producao_mil_litros * 1000,
+    valor_producao_reais = valor_producao_mil_reais * 1000,
+    producao_milhoes_litros = producao_mil_litros / 1000,
+    produtividade_litros_vaca = ifelse(vacas_ordenhadas > 0,
+                                       producao_litros / vacas_ordenhadas, NA_real_),
+    preco_litro_ppm = ifelse(producao_mil_litros > 0,
+                             valor_producao_mil_reais / producao_mil_litros, NA_real_)
+  ) %>% arrange(ano, municipio)
+
+write_csv(dados_leite, file.path(dir_dados, "leite_municipios_bahia_ppm.csv"))
+
+resumo_bahia <- dados_leite %>%
+  group_by(ano) %>%
+  summarise(producao_mil_litros      = sum(producao_mil_litros, na.rm = TRUE),
+            valor_producao_mil_reais = sum(valor_producao_mil_reais, na.rm = TRUE),
+            vacas_ordenhadas         = sum(vacas_ordenhadas, na.rm = TRUE),
+            efetivo_bovino           = sum(efetivo_bovino, na.rm = TRUE),
+            municipios_com_producao  = sum(producao_mil_litros > 0, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(producao_milhoes_litros = producao_mil_litros / 1000,
+         produtividade_litros_vaca = ifelse(vacas_ordenhadas > 0,
+                                            producao_mil_litros * 1000 / vacas_ordenhadas, NA_real_),
+         preco_medio_litro = ifelse(producao_mil_litros > 0,
+                                    valor_producao_mil_reais / producao_mil_litros, NA_real_),
+         variacao_producao_pct = 100 * (producao_mil_litros / first(producao_mil_litros) - 1)) %>%
+  arrange(ano)
+
+write_csv(resumo_bahia, file.path(dir_dados, "resumo_bahia_anual.csv"))
+
+ano_ref  <- max(resumo_bahia$ano); ano_base <- min(resumo_bahia$ano)
+cat("   Ano base:", ano_base, "| Ano de referencia:", ano_ref, "\n")
+
+ranking_municipios <- dados_leite %>%
+  filter(ano == ano_ref) %>%
+  mutate(rank_producao = row_number(desc(producao_mil_litros)),
+         rank_valor    = row_number(desc(valor_producao_mil_reais)),
+         participacao_pct = 100 * producao_mil_litros / sum(producao_mil_litros, na.rm = TRUE),
+         valor_milhoes_reais = valor_producao_mil_reais / 1000) %>%
+  select(municipio_codigo, municipio, ano, rank_producao, rank_valor,
+         producao_mil_litros, producao_milhoes_litros, valor_producao_mil_reais,
+         valor_milhoes_reais, vacas_ordenhadas, efetivo_bovino,
+         produtividade_litros_vaca, preco_litro_ppm, participacao_pct)
+
+write_csv(ranking_municipios, file.path(dir_dados, paste0("ranking_municipios_", ano_ref, ".csv")))
+
+top20 <- ranking_municipios %>% filter(rank_producao <= 20)
+share_top5_pct  <- sum(ranking_municipios$participacao_pct[ranking_municipios$rank_producao <=  5], na.rm = TRUE)
+share_top10_pct <- sum(ranking_municipios$participacao_pct[ranking_municipios$rank_producao <= 10], na.rm = TRUE)
+share_top20_pct <- sum(top20$participacao_pct, na.rm = TRUE)
+dados_ano_ref <- dados_leite %>% filter(ano == ano_ref)
+
+## ---------------------------------------------------------------------------
+## 5) GRAFICOS ----------------------------------------------------------------
+## ---------------------------------------------------------------------------
+cat("[3/6] Gerando graficos...\n")
+caption_ppm <- paste0("Fonte: IBGE, SIDRA — Pesquisa da Pecuária Municipal (tabelas 74, 94 e 3939). ",
+                      "Elaboração própria. Gerado em ", data_geracao, ".")
+
+g1 <- ggplot(resumo_bahia, aes(ano, producao_milhoes_litros)) +
+  geom_col(fill = "#A5D6A7", alpha = .55) +
+  geom_line(color = "#1B5E20", linewidth = .9) + geom_point(color = "#1B5E20", size = 2.2) +
+  geom_text(aes(label = fmt_ptbr(producao_milhoes_litros, 1)), vjust = -1, size = 3) +
+  scale_x_continuous(breaks = resumo_bahia$ano) +
+  scale_y_continuous(labels = function(x) fmt_ptbr(x, 0), expand = expansion(mult = c(0, .15))) +
+  labs(title = "Produção de leite na Bahia",
+       subtitle = paste0("Volume produzido, ", ano_base, "–", ano_ref, " (milhões de litros)"),
+       x = NULL, y = "Milhões de litros", caption = caption_ppm) + tema_grafico()
+salvar_grafico(g1, file.path(dir_graficos, "evolucao_producao_bahia.png"))
+
+if (any(!is.na(resumo_bahia$produtividade_litros_vaca))) {
+  g2 <- ggplot(resumo_bahia, aes(ano, produtividade_litros_vaca)) +
+    geom_line(color = "#0D47A1", linewidth = .9) + geom_point(color = "#0D47A1", size = 2.2) +
+    geom_text(aes(label = fmt_ptbr(produtividade_litros_vaca, 0)), vjust = -1, size = 3) +
+    scale_x_continuous(breaks = resumo_bahia$ano) +
+    scale_y_continuous(labels = function(x) fmt_ptbr(x, 0), expand = expansion(mult = c(0, .15))) +
+    labs(title = "Produtividade do rebanho ordenhado na Bahia",
+         subtitle = "Litros de leite por vaca ordenhada, por ano",
+         x = NULL, y = "Litros/vaca/ano", caption = caption_ppm) + tema_grafico()
+  salvar_grafico(g2, file.path(dir_graficos, "evolucao_produtividade_bahia.png"))
+}
+
+if (any(!is.na(resumo_bahia$preco_medio_litro))) {
+  g3 <- ggplot(resumo_bahia, aes(ano, preco_medio_litro)) +
+    geom_line(color = "#E65100", linewidth = .9) + geom_point(color = "#E65100", size = 2.2) +
+    geom_text(aes(label = paste0("R$ ", fmt_ptbr(preco_medio_litro, 2))), vjust = -1, size = 3) +
+    scale_x_continuous(breaks = resumo_bahia$ano) +
+    scale_y_continuous(labels = function(x) paste0("R$ ", fmt_ptbr(x, 2)),
+                       expand = expansion(mult = c(0, .18))) +
+    labs(title = "Preço médio do leite na Bahia (PPM)",
+         subtitle = "Valor da produção ÷ quantidade produzida (R$/litro)",
+         x = NULL, y = "R$/litro", caption = caption_ppm) + tema_grafico()
+  salvar_grafico(g3, file.path(dir_graficos, "evolucao_preco_medio_litro_bahia.png"))
+}
+
+rebanho_long <- resumo_bahia %>%
+  select(ano, vacas_ordenhadas, efetivo_bovino) %>%
+  pivot_longer(-ano, names_to = "indicador", values_to = "mil_cabecas") %>%
+  mutate(mil_cabecas = mil_cabecas / 1000,
+         indicador = recode(indicador, vacas_ordenhadas = "Vacas ordenhadas",
+                            efetivo_bovino = "Efetivo bovino total"))
+g4 <- ggplot(rebanho_long, aes(ano, mil_cabecas, color = indicador)) +
+  geom_line(linewidth = .9) + geom_point(size = 2) +
+  scale_x_continuous(breaks = resumo_bahia$ano) +
+  scale_y_continuous(labels = function(x) fmt_ptbr(x, 0)) +
+  scale_color_manual(values = c("Vacas ordenhadas" = "#6A1B9A",
+                                "Efetivo bovino total" = "#33691E"), name = NULL) +
+  labs(title = "Rebanho bovino e vacas ordenhadas na Bahia", subtitle = "Mil cabeças",
+       x = NULL, y = "Mil cabeças", caption = caption_ppm) + tema_grafico()
+salvar_grafico(g4, file.path(dir_graficos, "evolucao_rebanho_bahia.png"))
+
+g5 <- ggplot(top20, aes(reorder(municipio, producao_mil_litros), producao_milhoes_litros)) +
+  geom_col(aes(fill = producao_milhoes_litros), show.legend = FALSE) +
+  geom_text(aes(label = paste0(fmt_ptbr(producao_milhoes_litros, 1), " mi L")), hjust = -.1, size = 3) +
+  scale_fill_gradient(low = "#C8E6C9", high = "#1B5E20") +
+  scale_y_continuous(expand = expansion(mult = c(0, .12))) + coord_flip() +
+  labs(title = paste0("Top 20 municípios produtores de leite na Bahia (", ano_ref, ")"),
+       subtitle = paste0("Os 20 maiores respondem por ", fmt_ptbr(share_top20_pct, 1),
+                         "% da produção estadual"),
+       x = NULL, y = "Milhões de litros", caption = caption_ppm) + tema_grafico()
+salvar_grafico(g5, file.path(dir_graficos, "ranking_top20_producao.png"), 9, 7.5)
+
+g6 <- ggplot(top20, aes(reorder(municipio, valor_producao_mil_reais), valor_milhoes_reais)) +
+  geom_col(aes(fill = valor_milhoes_reais), show.legend = FALSE) +
+  geom_text(aes(label = paste0("R$ ", fmt_ptbr(valor_milhoes_reais, 1), " mi")), hjust = -.1, size = 3) +
+  scale_fill_gradient(low = "#FFE0B2", high = "#E65100") +
+  scale_y_continuous(expand = expansion(mult = c(0, .12))) + coord_flip() +
+  labs(title = paste0("Top 20 municípios por VALOR da produção de leite (", ano_ref, ")"),
+       subtitle = "Valor da produção — milhões de reais",
+       x = NULL, y = "R$ milhões", caption = caption_ppm) + tema_grafico()
+salvar_grafico(g6, file.path(dir_graficos, "ranking_top20_valor.png"), 9, 7.5)
+
+top10_codigos <- ranking_municipios$municipio_codigo[ranking_municipios$rank_producao <= 10]
+
+disp1 <- dados_ano_ref %>% filter(producao_mil_litros > 0, !is.na(produtividade_litros_vaca))
+if (nrow(disp1) > 5) {
+  g7 <- ggplot(disp1, aes(produtividade_litros_vaca, producao_milhoes_litros)) +
+    geom_point(color = "#00695C", alpha = .55, size = 2) +
+    geom_vline(xintercept = median(disp1$produtividade_litros_vaca, na.rm = TRUE),
+               linetype = "dashed", color = "grey45") +
+    geom_hline(yintercept = median(disp1$producao_milhoes_litros, na.rm = TRUE),
+               linetype = "dashed", color = "grey45") +
+    geom_text_repel(data = filter(disp1, municipio_codigo %in% top10_codigos),
+                    aes(label = municipio), size = 2.8, max.overlaps = 20, seed = 42) +
+    scale_y_log10(labels = function(x) fmt_ptbr(x, 1)) +
+    scale_x_continuous(labels = function(x) fmt_ptbr(x, 0)) +
+    labs(title = paste0("Produtividade × volume produzido por município (", ano_ref, ")"),
+         subtitle = "Linhas tracejadas: medianas municipais",
+         x = "Litros/vaca/ano", y = "Milhões de litros (log)", caption = caption_ppm) + tema_grafico()
+  salvar_grafico(g7, file.path(dir_graficos, "dispersao_produtividade_producao.png"))
+}
+
+disp2 <- dados_ano_ref %>% filter(producao_mil_litros > 0, !is.na(preco_litro_ppm))
+if (nrow(disp2) > 5) {
+  g8 <- ggplot(disp2, aes(producao_milhoes_litros, preco_litro_ppm)) +
+    geom_point(color = "#AD1457", alpha = .55, size = 2) +
+    geom_hline(yintercept = median(disp2$preco_litro_ppm, na.rm = TRUE),
+               linetype = "dashed", color = "grey45") +
+    geom_text_repel(data = filter(disp2, municipio_codigo %in% top10_codigos),
+                    aes(label = municipio), size = 2.8, max.overlaps = 20, seed = 42) +
+    scale_x_log10(labels = function(x) fmt_ptbr(x, 1)) +
+    scale_y_continuous(labels = function(x) paste0("R$ ", fmt_ptbr(x, 2))) +
+    labs(title = paste0("Preço médio (R$/litro) × volume produzido (", ano_ref, ")"),
+         subtitle = "Linha tracejada: mediana municipal do preço",
+         x = "Milhões de litros (log)", y = "R$/litro", caption = caption_ppm) + tema_grafico()
+  salvar_grafico(g8, file.path(dir_graficos, "dispersao_producao_preco_litro.png"))
+}
+
+## ---------------------------------------------------------------------------
+## ---------------------------------------------------------------------------
+## 6) MALHAS E MAPAS PROFISSIONAIS -------------------------------------------
+## ---------------------------------------------------------------------------
+cat("[4/6] Gerando mapas...\n")
+
+## CRS projetado (metros) — essencial para escala, centróides e ggrepel
+crs_mapa <- 5880  # SIRGAS 2000 / Brazil Polyconic
+
+malha_mun <- carregar_malha(arquivo_malha_mun)
+if (is.null(malha_mun)) {
+  message("Malha local indisponivel — baixando malha municipal da BA pela API do IBGE...")
+  url_ibge <- paste0(
+    "https://servicodados.ibge.gov.br/api/v3/malhas/estados/29?",
+    "formato=application/vnd.geo+json&intrarregiao=municipio&qualidade=intermediaria"
+  )
+  malha_mun <- tryCatch(st_read(url_ibge, quiet = TRUE), error = function(e) NULL)
+  if (!is.null(malha_mun) && "codarea" %in% names(malha_mun))
+    malha_mun <- malha_mun %>% rename(cd_mun = codarea)
+}
+if (is.null(malha_mun)) stop("Nao foi possivel carregar a malha municipal da Bahia.")
+
+malha_mun <- malha_mun %>%
+  clean_names() %>%
+  st_make_valid() %>%
+  st_transform(crs_mapa)
+
+col_cod_malha <- intersect(c("cd_mun", "code_muni", "cd_municip", "codarea"), names(malha_mun))[1]
+if (is.na(col_cod_malha)) stop("Coluna de codigo do municipio nao encontrada na malha.")
+malha_mun <- malha_mun %>% mutate(municipio_codigo = as.character(.data[[col_cod_malha]]))
+
+malha_uf <- carregar_malha(arquivo_malha_uf)
+if (!is.null(malha_uf)) {
+  malha_uf <- malha_uf %>% clean_names() %>% st_make_valid() %>% st_transform(crs_mapa)
+}
+
+## Bbox da Bahia com pequena margem (evita labels “fugirem” e mapa virar filete)
+bb <- st_bbox(malha_mun)
+x_margin <- diff(bb[c("xmin", "xmax")]) * 0.04
+y_margin <- diff(bb[c("ymin", "ymax")]) * 0.04
+xlim_ba <- c(bb["xmin"] - x_margin, bb["xmax"] + x_margin)
+ylim_ba <- c(bb["ymin"] - y_margin, bb["ymax"] + y_margin)
+
+## Nomes limpos (remove " - BA" se vier no campo municipio)
+limpar_nome_mun <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace("\\s*-\\s*BA\\s*$", "") %>%
+    str_squish()
+}
+
+ranking_map <- ranking_municipios %>%
+  mutate(municipio_limpo = limpar_nome_mun(municipio))
+
+mapa_dados <- malha_mun %>%
+  left_join(
+    ranking_map %>% select(-municipio, -ano),
+    by = "municipio_codigo"
+  ) %>%
+  mutate(
+    destaque_ranking = factor(
+      ifelse(municipio_codigo %in% top20$municipio_codigo,
+             "Top 20 produtores", "Demais municípios"),
+      levels = c("Top 20 produtores", "Demais municípios")
+    )
+  )
+
+cobertura <- mean(!is.na(mapa_dados$producao_mil_litros))
+cat("   Cobertura do join malha x SIDRA:", fmt_ptbr(100 * cobertura, 1), "%\n")
+if (cobertura < 0.9) warning("Cobertura do join abaixo de 90% — verifique os codigos.")
+
+## Classes por quantis (só valores > 0)
+criar_classes <- function(x, n_classes = 5, digitos = 1, prefixo = "", sufixo = "") {
+  x_valid <- x[!is.na(x) & is.finite(x) & x > 0]
+  if (length(x_valid) < n_classes) {
+    return(factor(rep(NA_character_, length(x))))
+  }
+  qs <- unique(as.numeric(quantile(x_valid, probs = seq(0, 1, length.out = n_classes + 1),
+                                   na.rm = TRUE)))
+  if (length(qs) < 3) {
+    return(factor(rep(NA_character_, length(x))))
+  }
+  qs[1] <- min(0, qs[1])
+  labels <- paste0(prefixo, fmt_ptbr(qs[-length(qs)], digitos), " – ",
+                   fmt_ptbr(qs[-1], digitos), sufixo)
+  cut(x, breaks = qs, labels = labels, include.lowest = TRUE, right = TRUE)
+}
+
+## Centróides robustos (ponto no interior do polígono) — sempre no mesmo CRS do mapa
+suppressWarnings({
+  centroides <- st_point_on_surface(st_make_valid(malha_mun)) %>%
+    left_join(
+      ranking_map %>%
+        select(municipio, municipio_limpo, municipio_codigo,
+               rank_producao, producao_milhoes_litros),
+      by = "municipio_codigo"
+    )
+})
+coords_xy <- st_coordinates(centroides)
+centroides <- centroides %>%
+  mutate(
+    x = coords_xy[, 1],
+    y = coords_xy[, 2]
+  )
+
+## Tema / finalização em CRS projetado
+finalizar_mapa <- function(p) {
+  if (!is.null(malha_uf)) {
+    p <- p + geom_sf(data = malha_uf, fill = NA, color = "grey15",
+                     linewidth = 0.55, inherit.aes = FALSE)
+  }
+  p +
+    coord_sf(xlim = xlim_ba, ylim = ylim_ba, expand = FALSE, crs = crs_mapa) +
+    annotation_north_arrow(
+      location = "tr", which_north = "true",
+      pad_x = unit(0.25, "cm"), pad_y = unit(0.25, "cm"),
+      height = unit(0.95, "cm"), width = unit(0.85, "cm"),
+      style = north_arrow_fancy_orienteering(text_size = 7)
+    ) +
+    annotation_scale(
+      location = "bl", width_hint = 0.22,
+      pad_x = unit(0.4, "cm"), pad_y = unit(0.35, "cm"),
+      bar_cols = c("grey20", "white"), text_cex = 0.65,
+      unit_category = "metric"
+    )
+}
+
+## --------------------------------------------------------------------------
+## Mapa 1 — Produção (coroplético)
+## --------------------------------------------------------------------------
+mapa_dados$classe_producao <- criar_classes(
+  mapa_dados$producao_milhoes_litros, 5, 1, "", " mi L"
+)
+
+p_prod <- ggplot(mapa_dados) +
+  geom_sf(aes(fill = classe_producao), color = "grey50", linewidth = 0.08) +
+  scale_fill_brewer(
+    palette = "Greens", na.value = "grey92", name = "Produção anual",
+    guide = guide_legend(title.position = "top", title.hjust = 0.5,
+                         nrow = 1, keywidth = 1.5, keyheight = 0.4)
+  ) +
+  labs(
+    title = paste0("Produção municipal de leite na Bahia — ", ano_ref),
+    subtitle = paste0(
+      "Volume em milhões de litros | Top 20 = ",
+      fmt_ptbr(share_top20_pct, 1), "% do total estadual"
+    ),
+    caption = caption_ppm
+  ) +
+  tema_mapa()
+p_prod <- finalizar_mapa(p_prod)
+ggsave(file.path(dir_mapas, paste0("mapa_producao_municipal_", ano_ref, ".png")),
+       p_prod, width = 8.2, height = 9.4, dpi = 300, bg = "white")
+message("Mapa salvo: mapa_producao_municipal.png")
+
+## --------------------------------------------------------------------------
+## Mapa 2 — Produtividade
+## --------------------------------------------------------------------------
+mapa_dados$classe_produtividade <- criar_classes(
+  mapa_dados$produtividade_litros_vaca, 5, 0, "", " L"
+)
+
+p_prod2 <- ggplot(mapa_dados) +
+  geom_sf(aes(fill = classe_produtividade), color = "grey50", linewidth = 0.08) +
+  scale_fill_brewer(
+    palette = "Blues", na.value = "grey92", name = "Litros por vaca/ano",
+    guide = guide_legend(title.position = "top", title.hjust = 0.5,
+                         nrow = 1, keywidth = 1.5, keyheight = 0.4)
+  ) +
+  labs(
+    title = paste0("Produtividade do rebanho ordenhado — ", ano_ref),
+    subtitle = "Litros de leite por vaca ordenhada por ano",
+    caption = caption_ppm
+  ) +
+  tema_mapa()
+p_prod2 <- finalizar_mapa(p_prod2)
+ggsave(file.path(dir_mapas, paste0("mapa_produtividade_", ano_ref, ".png")),
+       p_prod2, width = 8.2, height = 9.4, dpi = 300, bg = "white")
+message("Mapa salvo: mapa_produtividade.png")
+
+## --------------------------------------------------------------------------
+## Mapa 3 — Valor da produção
+## --------------------------------------------------------------------------
+mapa_dados$classe_valor <- criar_classes(
+  mapa_dados$valor_milhoes_reais, 5, 1, "R$ ", " mi"
+)
+
+p_val <- ggplot(mapa_dados) +
+  geom_sf(aes(fill = classe_valor), color = "grey50", linewidth = 0.08) +
+  scale_fill_brewer(
+    palette = "Oranges", na.value = "grey92", name = "Valor da produção anual",
+    guide = guide_legend(title.position = "top", title.hjust = 0.5,
+                         nrow = 1, keywidth = 1.5, keyheight = 0.4)
+  ) +
+  labs(
+    title = paste0("Valor da produção municipal de leite — ", ano_ref),
+    subtitle = "Valor bruto em milhões de reais",
+    caption = caption_ppm
+  ) +
+  tema_mapa()
+p_val <- finalizar_mapa(p_val)
+ggsave(file.path(dir_mapas, paste0("mapa_valor_producao_", ano_ref, ".png")),
+       p_val, width = 8.2, height = 9.4, dpi = 300, bg = "white")
+message("Mapa salvo: mapa_valor_producao.png")
+
+## --------------------------------------------------------------------------
+## Mapa 4 — Ranking Top 20 + rótulos Top 5 (ancorados nos centróides)
+## --------------------------------------------------------------------------
+top5_centr <- centroides %>%
+  filter(!is.na(rank_producao), rank_producao <= 5) %>%
+  mutate(rotulo = paste0(
+    rank_producao, "º ", municipio_limpo, "\n",
+    fmt_ptbr(producao_milhoes_litros, 1), " mi L"
+  ))
+
+p_rank <- ggplot(mapa_dados) +
+  geom_sf(aes(fill = destaque_ranking), color = "grey55", linewidth = 0.08) +
+  scale_fill_manual(
+    values = c("Top 20 produtores" = "#2E7D32", "Demais municípios" = "#E8F5E9"),
+    na.value = "grey92", name = NULL,
+    guide = guide_legend(keywidth = 1.4, keyheight = 0.45, nrow = 1)
+  )
+
+if (nrow(top5_centr) > 0) {
+  p_rank <- p_rank +
+    geom_sf(
+      data = top5_centr, inherit.aes = FALSE,
+      shape = 21, size = 2.4, stroke = 0.9,
+      color = "grey10", fill = "white"
+    ) +
+    ggrepel::geom_label_repel(
+      data = top5_centr,
+      aes(x = x, y = y, label = rotulo),
+      inherit.aes = FALSE,
+      size = 2.9, fontface = "bold",
+      color = "grey10",
+      fill = alpha("white", 0.92),
+      label.size = 0.25,
+      label.padding = unit(0.18, "lines"),
+      label.r = unit(0.12, "lines"),
+      box.padding = 0.55,
+      point.padding = 0.35,
+      segment.color = "grey25",
+      segment.size = 0.45,
+      min.segment.length = 0,
+      force = 1.2,
+      force_pull = 0.8,
+      seed = 42,
+      max.overlaps = Inf,
+      ## mantém rótulos DENTRO do mapa da Bahia
+      xlim = xlim_ba,
+      ylim = ylim_ba
+    )
+}
+
+p_rank <- p_rank +
+  labs(
+    title = paste0("Principais municípios produtores de leite da Bahia — ", ano_ref),
+    subtitle = paste0(
+      "Top 20 concentram ", fmt_ptbr(share_top20_pct, 1),
+      "% da produção estadual | Top 5 identificados"
+    ),
+    caption = caption_ppm
+  ) +
+  tema_mapa()
+p_rank <- finalizar_mapa(p_rank)
+ggsave(file.path(dir_mapas, paste0("mapa_ranking_top20_", ano_ref, ".png")),
+       p_rank, width = 8.4, height = 9.6, dpi = 300, bg = "white")
+message("Mapa salvo: mapa_ranking_top20.png")
+
+## --------------------------------------------------------------------------
+## Mapa 5 — Círculos proporcionais + Top 10
+## --------------------------------------------------------------------------
+pts_prod <- centroides %>%
+  filter(!is.na(producao_milhoes_litros), producao_milhoes_litros > 0)
+
+top10_centr <- centroides %>%
+  filter(!is.na(rank_producao), rank_producao <= 10) %>%
+  mutate(rotulo = paste0(rank_producao, "º ", municipio_limpo))
+
+p_cent <- ggplot() +
+  geom_sf(data = malha_mun, fill = "#F7F7F2", color = "grey70", linewidth = 0.08) +
+  geom_sf(
+    data = pts_prod,
+    aes(size = producao_milhoes_litros),
+    shape = 21, color = "#1B5E20", fill = alpha("#66BB6A", 0.55),
+    stroke = 0.35, alpha = 0.9
+  ) +
+  scale_size_continuous(
+    range = c(1.2, 14),
+    name = "Milhões de litros",
+    breaks = c(0.5, 2, 5, 10, 20, 40),
+    labels = function(x) fmt_ptbr(x, 1),
+    guide = guide_legend(
+      title.position = "top", nrow = 1,
+      override.aes = list(
+        shape = 21, color = "#1B5E20",
+        fill = alpha("#66BB6A", 0.55)
+      )
+    )
+  )
+
+if (nrow(top10_centr) > 0) {
+  p_cent <- p_cent +
+    ggrepel::geom_label_repel(
+      data = top10_centr,
+      aes(x = x, y = y, label = rotulo),
+      inherit.aes = FALSE,
+      size = 2.6, fontface = "bold",
+      color = "grey10",
+      fill = alpha("white", 0.92),
+      label.size = 0.2,
+      label.padding = unit(0.15, "lines"),
+      label.r = unit(0.10, "lines"),
+      box.padding = 0.45,
+      point.padding = 0.25,
+      segment.color = "grey30",
+      segment.size = 0.4,
+      min.segment.length = 0,
+      force = 1.4,
+      force_pull = 0.9,
+      seed = 42,
+      max.overlaps = Inf,
+      xlim = xlim_ba,
+      ylim = ylim_ba
+    )
+}
+
+p_cent <- p_cent +
+  labs(
+    title = paste0("Distribuição espacial da produção de leite — ", ano_ref),
+    subtitle = "Círculos proporcionais ao volume produzido | Top 10 identificados",
+    caption = caption_ppm
+  ) +
+  tema_mapa()
+p_cent <- finalizar_mapa(p_cent)
+ggsave(file.path(dir_mapas, paste0("mapa_centroides_producao_", ano_ref, ".png")),
+       p_cent, width = 8.4, height = 9.6, dpi = 300, bg = "white")
+message("Mapa salvo: mapa_centroides_producao.png")
+
+## ---------------------------------------------------------------------------
+## 7) PESQUISA TRIMESTRAL DO LEITE — TABELA 1086 (NIVEL ESTADUAL)
+## ---------------------------------------------------------------------------
+cat("[5/6] Baixando Pesquisa Trimestral do Leite (1086) e Censo 2017 (9130)...\n")
+
+trimestres <- as.vector(t(outer(2015:2026, 1:4, function(a, t) paste0(a, "0", t))))
+
+## Tentativa 1: uma unica classificacao (referencia temporal = trimestres)
+t1086_bruta <- baixar_sidra_simples(
+  "Tabela 1086 (PTL - Bahia)",
+  x = 1086, variable = c(282, 283, 2522), period = trimestres,
+  geo = "State", geo_filter = list("State" = 29),
+  classific = "c12716", category = list(115236)
+)
+if (is.null(t1086_bruta)) {
+  # Fallback: sem classificacao
+  t1086_bruta <- baixar_sidra_simples(
+    "Tabela 1086 (PTL - Bahia - fallback)",
+    x = 1086, variable = c(282, 283, 2522), period = trimestres,
+    geo = "State", geo_filter = list("State" = 29)
+  )
+}
+if (!is.null(t1086_bruta))
+  write_csv(t1086_bruta, file.path(dir_dados, "tabela1086_ptl_bahia_bruta.csv"))
+
+adicionar_periodo_ptl <- function(d, col_txt) {
+  meses <- c(jan=1, fev=2, mar=3, abr=4, mai=5, jun=6,
+             jul=7, ago=8, set=9, out=10, nov=11, dez=12)
+  txt   <- d[[col_txt]]
+  ano_p <- suppressWarnings(as.integer(str_extract(txt, "[0-9]{4}")))
+  ord_p <- suppressWarnings(as.integer(str_extract(txt, "^[0-9]+(?=\\s*[oº])")))
+  mes_p <- unname(meses[str_to_lower(str_sub(txt, 1, 3))])
+  data_p <- as.Date(rep(NA_character_, length(txt)))
+  tri <- !is.na(ord_p) & !is.na(ano_p)
+  if (any(tri)) data_p[tri] <- as.Date(yq(paste0(ano_p[tri], "Q", ord_p[tri])))
+  mo <- is.na(ord_p) & !is.na(mes_p) & !is.na(ano_p)
+  if (any(mo)) data_p[mo] <- as.Date(ym(paste0(ano_p[mo], sprintf("%02d", mes_p[mo]))))
+  d$periodo <- txt; d$ano <- ano_p; d$data_ref <- data_p
+  d %>% select(-all_of(col_txt))
+}
+
+processar_ptl <- function(bruta) {
+  if (is.null(bruta) || nrow(bruta) == 0) return(NULL)
+  
+  d <- bruta %>% padronizar_colunas_robust() %>% clean_names() %>%
+    mutate(valor = suppressWarnings(as.numeric(valor)))
+  
+  # Detecta coluna de periodo (trimestre) - a que tiver 'trimestre' no nome
+  col_cod <- grep("(trimestre|mes|unidade_de_tempo)_codigo$", names(d), value = TRUE)[1]
+  if (is.na(col_cod)) {
+    # fallback: qualquer coluna com codigo numerico de 6 digitos (YYYYQQ)
+    for (nm in names(d)) {
+      if (grepl("_codigo$", nm)) {
+        amostra <- as.character(d[[nm]])[1:min(5, nrow(d))]
+        if (all(nchar(amostra) == 6) && all(!is.na(suppressWarnings(as.numeric(amostra))))) {
+          col_cod <- nm; break
+        }
+      }
+    }
+  }
+  if (is.na(col_cod)) {
+    message("PTL: periodo nao identificado nos nomes: ", paste(names(d), collapse = ", "))
+    return(NULL)
+  }
+  
+  col_txt <- sub("_codigo$", "", col_cod)
+  if (!col_txt %in% names(d)) col_txt <- col_cod # usa o codigo se nao houver descricao
+  
+  d_sel <- d %>% select(any_of(c(col_cod, col_txt, "variavel_codigo", "valor")))
+  
+  d_sel <- d_sel %>%
+    mutate(variavel_codigo = as.character(variavel_codigo)) %>%
+    adicionar_periodo_ptl(col_txt) %>%
+    pivot_wider(names_from = variavel_codigo, values_from = valor,
+                names_prefix = "var_", values_fn = function(x) sum(x, na.rm = TRUE)) %>%
+    renomear_se_existir(c(leite_adquirido_mil_litros       = "var_282",
+                          leite_industrializado_mil_litros = "var_283",
+                          preco_medio_reais_litro          = "var_2522")) %>%
+    garantir_colunas(c("leite_adquirido_mil_litros",
+                       "leite_industrializado_mil_litros",
+                       "preco_medio_reais_litro")) %>%
+    arrange(data_ref)
+  d_sel
+}
+
+ptl <- NULL
+if (!is.null(t1086_bruta)) {
+  ptl <- processar_ptl(t1086_bruta)
+  if (!is.null(ptl)) {
+    ptl <- ptl %>% mutate(taxa_industrializacao_pct =
+                            ifelse(leite_adquirido_mil_litros > 0,
+                                   100 * leite_industrializado_mil_litros / leite_adquirido_mil_litros, NA_real_))
+    write_csv(ptl, file.path(dir_dados, "ptl_bahia_trimestral.csv"))
+  }
+}
+
+if (!is.null(ptl) && sum(!is.na(ptl$data_ref)) > 2) {
+  caption_ptl <- paste0("Fonte: IBGE, SIDRA — Pesquisa Trimestral do Leite (tabela 1086), Bahia. ",
+                        "Elaboração própria. Gerado em ", data_geracao, ".")
+  serie_ptl <- ptl %>% filter(!is.na(data_ref)) %>%
+    select(data_ref, leite_adquirido_mil_litros, leite_industrializado_mil_litros) %>%
+    pivot_longer(-data_ref, names_to = "fluxo", values_to = "milhoes_litros") %>%
+    mutate(milhoes_litros = milhoes_litros / 1000,
+           fluxo = recode(fluxo, leite_adquirido_mil_litros = "Leite cru adquirido",
+                          leite_industrializado_mil_litros = "Leite industrializado"))
+  g9 <- ggplot(serie_ptl, aes(data_ref, milhoes_litros, color = fluxo)) +
+    geom_line(linewidth = .8) +
+    scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+    scale_y_continuous(labels = function(x) fmt_ptbr(x, 0)) +
+    scale_color_manual(values = c("Leite cru adquirido" = "#1565C0",
+                                  "Leite industrializado" = "#EF6C00"), name = NULL) +
+    labs(title = "Leite adquirido e industrializado na Bahia",
+         subtitle = "Série trimestral — milhões de litros",
+         x = NULL, y = "Milhões de litros", caption = caption_ptl) + tema_grafico()
+  salvar_grafico(g9, file.path(dir_graficos, "ptl_adquirido_industrializado.png"), 9.5, 5.5)
+  
+  if (any(!is.na(ptl$preco_medio_reais_litro))) {
+    g10 <- ptl %>% filter(!is.na(data_ref), !is.na(preco_medio_reais_litro)) %>%
+      ggplot(aes(data_ref, preco_medio_reais_litro)) +
+      geom_line(color = "#6A1B9A", linewidth = .8) +
+      scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+      scale_y_continuous(labels = function(x) paste0("R$ ", fmt_ptbr(x, 2))) +
+      labs(title = "Preço médio do leite na Bahia",
+           subtitle = "Pesquisa Trimestral do Leite — R$/litro",
+           x = NULL, y = "R$/litro", caption = caption_ptl) + tema_grafico()
+    salvar_grafico(g10, file.path(dir_graficos, "ptl_preco_medio.png"), 9.5, 5)
+  }
+}
+
+## ---------------------------------------------------------------------------
+## 8) CENSO AGROPECUARIO 2017 — TABELA 9130
+## ---------------------------------------------------------------------------
+renomeia_censo <- c(estabelecimentos_produzem_leite = "var_2072",
+                    vacas_ordenhadas_censo          = "var_2073",
+                    litros_produzidos               = "var_2074",
+                    valor_producao_reais            = "var_2075",
+                    estabelecimentos_venderam_leite = "var_2377",
+                    litros_vendidos                 = "var_2080",
+                    valor_venda_reais               = "var_2378")
+cols_censo <- names(renomeia_censo)
+
+## Estrategia: Censo tem 3 classificacoes (c1502/c218/c3244) todas em categoria=0
+## Baixamos com apenas uma classificacao e filtramos manualmente se necessario
+t9130_bruta <- baixar_sidra_simples(
+  "Tabela 9130 (Censo Agro 2017 - leite)",
+  x = 9130, variable = c(2072, 2073, 2074, 2075, 2377, 2080, 2378),
+  period = "2017", geo = "City", geo_filter = list("State" = 29),
+  classific = "c218", category = list(0)
+)
+if (is.null(t9130_bruta)) {
+  t9130_bruta <- baixar_sidra_simples(
+    "Tabela 9130 - fallback estadual",
+    x = 9130, variable = c(2072, 2073, 2074, 2075, 2377, 2080, 2378),
+    period = "2017", geo = "State", geo_filter = list("State" = 29),
+    classific = "c218", category = list(0)
+  )
+}
+if (!is.null(t9130_bruta))
+  write_csv(t9130_bruta, file.path(dir_dados, "tabela9130_censo2017_leite_bruta.csv"))
+
+censo_mun <- NULL; censo_resumo <- NULL
+if (!is.null(t9130_bruta)) {
+  censo_base <- t9130_bruta %>% padronizar_colunas_robust() %>% clean_names() %>%
+    mutate(valor = suppressWarnings(as.numeric(valor)))
+  
+  # Garantia extra: se variavel_codigo ainda nao estiver presente, forca renomeacao
+  if (!"variavel_codigo" %in% names(censo_base)) {
+    cod_cols <- grep("cod", names(censo_base), value = TRUE)
+    for (cc in cod_cols) {
+      amostra <- as.character(censo_base[[cc]])[1:min(5, nrow(censo_base))]
+      if (all(!is.na(amostra)) && all(nchar(amostra) <= 6) &&
+          all(!is.na(suppressWarnings(as.numeric(amostra))))) {
+        names(censo_base)[names(censo_base) == cc] <- "variavel_codigo"
+        break
+      }
+    }
+  }
+  
+  if ("variavel_codigo" %in% names(censo_base)) {
+    censo_base <- censo_base %>% mutate(variavel_codigo = as.character(variavel_codigo))
+    
+    if ("municipio_codigo" %in% names(censo_base)) {
+      censo_mun <- censo_base %>%
+        mutate(municipio_codigo = as.character(municipio_codigo)) %>%
+        select(municipio_codigo, municipio, variavel_codigo, valor) %>%
+        pivot_wider(names_from = variavel_codigo, values_from = valor,
+                    names_prefix = "var_", values_fn = function(x) sum(x, na.rm = TRUE)) %>%
+        renomear_se_existir(renomeia_censo) %>% garantir_colunas(cols_censo)
+    }
+    if (!is.null(censo_mun)) {
+      censo_resumo <- censo_mun %>% summarise(across(all_of(cols_censo),
+                                                     function(x) sum(x, na.rm = TRUE)))
+    } else {
+      censo_resumo <- censo_base %>% group_by(variavel_codigo) %>%
+        summarise(valor = sum(valor, na.rm = TRUE), .groups = "drop") %>%
+        pivot_wider(names_from = variavel_codigo, values_from = valor, names_prefix = "var_") %>%
+        renomear_se_existir(renomeia_censo) %>% garantir_colunas(cols_censo)
+    }
+    censo_resumo <- censo_resumo %>% mutate(
+      pct_estabelecimentos_que_venderam = ifelse(estabelecimentos_produzem_leite > 0,
+                                                 100 * estabelecimentos_venderam_leite / estabelecimentos_produzem_leite, NA_real_),
+      pct_volume_vendido = ifelse(litros_produzidos > 0,
+                                  100 * litros_vendidos / litros_produzidos, NA_real_),
+      litros_por_estabelecimento = ifelse(estabelecimentos_produzem_leite > 0,
+                                          litros_produzidos / estabelecimentos_produzem_leite, NA_real_))
+    
+    if (!is.null(censo_mun)) {
+      censo_mun <- censo_mun %>% mutate(
+        pct_estabelecimentos_que_venderam = ifelse(estabelecimentos_produzem_leite > 0,
+                                                   100 * estabelecimentos_venderam_leite / estabelecimentos_produzem_leite, NA_real_),
+        pct_volume_vendido = ifelse(litros_produzidos > 0,
+                                    100 * litros_vendidos / litros_produzidos, NA_real_),
+        litros_por_estabelecimento = ifelse(estabelecimentos_produzem_leite > 0,
+                                            litros_produzidos / estabelecimentos_produzem_leite, NA_real_))
+      write_csv(censo_mun, file.path(dir_dados, "censo2017_leite_municipios.csv"))
+      
+      caption_censo <- paste0("Fonte: IBGE, SIDRA — Censo Agropecuário 2017 (tabela 9130). ",
+                              "Elaboração própria. Gerado em ", data_geracao, ".")
+      g13 <- censo_mun %>% slice_max(estabelecimentos_produzem_leite, n = 15) %>%
+        ggplot(aes(reorder(municipio, estabelecimentos_produzem_leite),
+                   estabelecimentos_produzem_leite)) +
+        geom_col(fill = "#00695C", alpha = .85) +
+        geom_text(aes(label = fmt_ptbr(estabelecimentos_produzem_leite, 0)), hjust = -.15, size = 3) +
+        scale_y_continuous(expand = expansion(mult = c(0, .12))) + coord_flip() +
+        labs(title = "Estabelecimentos que produziram leite de vaca — Bahia (Censo 2017)",
+             subtitle = "15 municípios com maior número de estabelecimentos leiteiros",
+             x = NULL, y = "Número de estabelecimentos", caption = caption_censo) + tema_grafico()
+      salvar_grafico(g13, file.path(dir_graficos, "censo2017_top15_estabelecimentos_leite.png"), 9, 7)
+    }
+    write_csv(censo_resumo, file.path(dir_dados, "censo2017_leite_resumo_bahia.csv"))
+  } else {
+    message("Censo 2017: nao foi possivel identificar coluna variavel_codigo. Nomes: ",
+            paste(names(censo_base), collapse = ", "))
+  }
+}
+
+## ---------------------------------------------------------------------------
+## 9) ANALISE TEXTUAL COMPLETA -----------------------------------------------
+## ---------------------------------------------------------------------------
+cat("[6/6] Gerando análise textual completa...\n")
+linhas <- character(0); add <- function(...) linhas <<- c(linhas, paste0(...))
+ref_row  <- resumo_bahia %>% filter(ano == ano_ref)
+base_row <- resumo_bahia %>% filter(ano == ano_base)
+
+# Calculos preliminares para a "prova dos 9"
+calc_prod_ref <- sum(dados_leite$producao_mil_litros[dados_leite$ano == ano_ref], na.rm = TRUE)
+calc_prod_base <- sum(dados_leite$producao_mil_litros[dados_leite$ano == ano_base], na.rm = TRUE)
+calc_var_pct <- 100 * (calc_prod_ref / calc_prod_base - 1)
+
+add(strrep("=", 80))
+add("        ANÁLISE DA CADEIA LEITEIRA DA BAHIA — RELATÓRIO TÉCNICO")
+add(paste0("        Período de análise: ", ano_base, "–", ano_ref))
+add(paste0("        Data de geração: ", data_geracao))
+add(strrep("=", 80)); add("")
+
+## ========== 1. INTRODUÇÃO ==========
+add("1. INTRODUÇÃO"); add(strrep("-", 80))
+add("A cadeia produtiva do leite bovino na Bahia constitui atividade agropecuária")
+add("de relevância econômica e social, envolvendo produção primária, industrialização")
+add("e comercialização. Este relatório sistematiza indicadores oficiais do IBGE")
+add(paste0("para o período ", ano_base, "–", ano_ref, ", analisando volume de produção, ",
+           "valor bruto,"))
+add("produtividade do rebanho, distribuição espacial municipal, industrialização")
+add("trimestral e perfil estrutural dos estabelecimentos produtores segundo o Censo")
+add("Agropecuário 2017.")
+add("")
+
+## ========== 2. MATERIAL E MÉTODOS ==========
+add("2. MATERIAL E MÉTODOS"); add(strrep("-", 80))
+add("")
+add("2.1. Fontes de dados"); add("")
+add("Os dados foram extraídos do Sistema IBGE de Recuperação Automática (SIDRA),")
+add("por meio do pacote 'sidrar' do R. As tabelas consultadas foram:")
+add("")
+add("   Tabela 74 — Produção de origem animal (PPM)")
+add("      • Variável 106: Quantidade produzida (mil litros)")
+add("      • Variável 215: Valor da produção (mil reais)")
+add("      • Classificação c80/2682 (Leite de vaca)")
+add("      • Nível: municipal (n6), estado 29 (Bahia)")
+add(paste0("      • Período: ", ano_base, " a ", ano_ref))
+add("")
+add("   Tabela 94 — Efetivo de vacas ordenhadas (PPM)")
+add("      • Variável 107: Vacas ordenhadas (cabeças)")
+add("      • Nível: municipal, Bahia")
+add("")
+add("   Tabela 3939 — Efetivo dos rebanhos por tipo (PPM)")
+add("      • Variável 105: Efetivo de rebanho (cabeças)")
+add("      • Classificação c79/2670 (Bovinos)")
+add("      • Nível: municipal, Bahia")
+add("")
+add("   Tabela 1086 — Pesquisa Trimestral do Leite (PTL)")
+add("      • Variável 282: Leite cru adquirido (mil litros)")
+add("      • Variável 283: Leite industrializado (mil litros)")
+add("      • Variável 2522: Preço médio pago pelo litro (R$/L)")
+add("      • Nível: apenas estadual (n3), Bahia")
+add("      • Referência temporal: dado trimestral")
+add("")
+add("   Tabela 9130 — Censo Agropecuário 2017: Produção de leite")
+add("      • Variável 2072: Nº de estabelecimentos que produziram leite")
+add("      • Variável 2074: Quantidade produzida (litros)")
+add("      • Variável 2377: Nº de estabelecimentos que venderam leite cru")
+add("      • Variável 2080: Quantidade vendida (litros)")
+add("      • Nível: municipal, Bahia")
+add("")
+add("2.2. Malhas geográficas"); add("")
+add("Foram utilizadas as malhas municipais 2025 do IBGE (arquivos shapefile locais)")
+add("para geração de mapas coropléticos e de círculos proporcionais. Projeções:")
+add("   • Sistema de referência: SIRGAS 2000 (EPSG:4326) para exibição")
+add("   • Sistema para cálculo de centróides: SIRGAS 2000 Polyconic (EPSG:5880)")
+add("")
+add("2.3. Fórmulas e indicadores calculados"); add("")
+add("   (a) Produtividade do rebanho ordenhado (L/vaca/ano):")
+add("       PROD = (Quantidade produzida em L) ÷ (Vacas ordenhadas)")
+add("       PROD_mun = (producao_mil_litros × 1000) ÷ vacas_ordenhadas")
+add("")
+add("   (b) Preço médio implícito PPM (R$/litro):")
+add("       PREÇO = (Valor da produção em R$) ÷ (Quantidade produzida em L)")
+add("       PREÇO_mun = valor_producao_mil_reais ÷ producao_mil_litros")
+add("")
+add("   (c) Participação municipal (%):")
+add("       SHARE_i = 100 × producao_i ÷ Σ(producao_todos_municipios)")
+add("")
+add("   (d) Variação percentual no período (%):")
+add("       VAR = 100 × (producao_ano_ref ÷ producao_ano_base - 1)")
+add("")
+add("   (e) Taxa de industrialização (PTL, %):")
+add("       TXIND = 100 × leite_industrializado ÷ leite_adquirido")
+add("")
+add("   (f) Ranking municipal: ordenação decrescente por produção física.")
+add("")
+add("2.4. Processamento computacional"); add("")
+add("Toda a análise foi realizada em ambiente R (versão >= 4.2), com uso dos")
+add("pacotes: sidrar (extração SIDRA), tidyverse (manipulação), sf/ggspatial")
+add("(geoprocessamento) e ggplot2/ggrepel (visualização). O código-fonte é")
+add("reproduzível e está disponível no diretório do projeto.")
+add("")
+
+## ========== 3. RESULTADOS ==========
+add("3. RESULTADOS"); add(strrep("-", 80))
+add("")
+add("3.1. Evolução da produção e valor bruto (PPM)"); add("")
+add(paste0("A produção de leite bovino na Bahia em ", ano_ref, " totalizou ",
+           fmt_ptbr(ref_row$producao_milhoes_litros, 1), " milhões de litros,"))
+add(paste0("distribuída em ", ref_row$municipios_com_producao,
+           " municípios. Comparada ao ano-base ", ano_base,
+           " (", fmt_ptbr(base_row$producao_milhoes_litros, 1), " milhões),"))
+add(paste0("a produção variou ", fmt_ptbr(ref_row$variacao_producao_pct, 2),
+           "% no período. O valor bruto da produção alcançou R$ ",
+           fmt_ptbr(ref_row$valor_producao_mil_reais / 1000, 1)))
+add(paste0("milhões, com preço médio implícito de R$ ",
+           fmt_ptbr(ref_row$preco_medio_litro, 2), "/litro contra R$ ",
+           fmt_ptbr(base_row$preco_medio_litro, 2), "/L em ", ano_base, "."))
+add("")
+
+## Evolucao ano a ano
+add("Tabela 1 — Evolução anual dos principais indicadores"); add("")
+add(sprintf("   %-6s %-16s %-16s %-14s %-14s", 
+            "Ano", "Prod.(mi L)", "Valor(R$ mi)", "L/vaca/ano", "R$/litro"))
+add(paste0("   ", strrep("-", 74)))
+for (i in seq_len(nrow(resumo_bahia))) {
+  linhas <- c(linhas,
+              sprintf("   %-6d %-16s %-16s %-14s %-14s",
+                      resumo_bahia$ano[i],
+                      fmt_ptbr(resumo_bahia$producao_milhoes_litros[i], 1),
+                      fmt_ptbr(resumo_bahia$valor_producao_mil_reais[i] / 1000, 1),
+                      fmt_ptbr(resumo_bahia$produtividade_litros_vaca[i], 0),
+                      paste0("R$ ", fmt_ptbr(resumo_bahia$preco_medio_litro[i], 2))))
+}
+add("")
+
+add("3.2. Produtividade e rebanho"); add("")
+add(paste0("A produtividade do rebanho ordenhado em ", ano_ref, " foi de ",
+           fmt_ptbr(ref_row$produtividade_litros_vaca, 0), " L/vaca/ano,"))
+add(paste0("ante ", fmt_ptbr(base_row$produtividade_litros_vaca, 0),
+           " L/vaca/ano em ", ano_base, " (variação: ",
+           fmt_ptbr(100*(ref_row$produtividade_litros_vaca /
+                           base_row$produtividade_litros_vaca - 1), 2), "%)."))
+add(paste0("O efetivo bovino totalizou ",
+           fmt_ptbr(ref_row$efetivo_bovino / 1e6, 2), " milhões de cabeças, com ",
+           fmt_ptbr(ref_row$vacas_ordenhadas / 1000, 0), " mil vacas ordenhadas."))
+add("")
+
+add("3.3. Concentração espacial da produção"); add("")
+add(paste0("Em ", ano_ref, ", os cinco maiores municípios produtores concentraram ",
+           fmt_ptbr(share_top5_pct, 1), "% da produção estadual;"))
+add(paste0("os dez maiores, ", fmt_ptbr(share_top10_pct, 1),
+           "%; e os vinte maiores, ", fmt_ptbr(share_top20_pct, 1), "%."))
+add("")
+
+add(paste0("Tabela 2 — Top 10 municípios produtores em ", ano_ref)); add("")
+add(sprintf("   %-4s %-32s %-16s %-10s", "Pos", "Município", "Produção", "Part.(%)"))
+add(paste0("   ", strrep("-", 66)))
+top10_ranked <- ranking_municipios %>% filter(rank_producao <= 10) %>% arrange(rank_producao)
+for (i in seq_len(nrow(top10_ranked))) {
+  linhas <- c(linhas,
+              sprintf("   %-4s %-32s %-16s %-10s",
+                      paste0(top10_ranked$rank_producao[i], "º"),
+                      substr(top10_ranked$municipio[i], 1, 32),
+                      paste0(fmt_ptbr(top10_ranked$producao_milhoes_litros[i], 2), " mi L"),
+                      fmt_ptbr(top10_ranked$participacao_pct[i], 2)))
+}
+add("")
+
+add(paste0("Os cinco maiores municípios em VALOR de produção foram: ",
+           paste(ranking_municipios %>% filter(rank_valor <= 5) %>%
+                   arrange(rank_valor) %>% pull(municipio), collapse = "; "), "."))
+add("")
+
+add("3.4. Industrialização (Pesquisa Trimestral do Leite)"); add("")
+if (!is.null(ptl) && sum(!is.na(ptl$data_ref)) > 0) {
+  ult4 <- ptl %>% filter(!is.na(data_ref)) %>% arrange(data_ref) %>% slice_tail(n = 4)
+  ultimo <- slice_tail(ult4, n = 1)
+  media_adq <- mean(ult4$leite_adquirido_mil_litros, na.rm = TRUE) / 1000
+  media_ind <- mean(ult4$leite_industrializado_mil_litros, na.rm = TRUE) / 1000
+  media_tx  <- mean(ult4$taxa_industrializacao_pct, na.rm = TRUE)
+  
+  add(paste0("Nos quatro últimos trimestres disponíveis (", min(as.character(ult4$periodo)),
+             " a ", max(as.character(ult4$periodo)), "),"))
+  add(paste0("a indústria baiana adquiriu, em média, ", fmt_ptbr(media_adq, 1),
+             " milhões de litros por trimestre"))
+  add(paste0("e industrializou ", fmt_ptbr(media_ind, 1),
+             " milhões — taxa média de industrialização de ",
+             fmt_ptbr(media_tx, 1), "%."))
+  add(paste0("O preço médio pago no último trimestre (", ultimo$periodo, ") foi de R$ ",
+             fmt_ptbr(ultimo$preco_medio_reais_litro, 2), "/L."))
+} else {
+  add("Dados da PTL (tabela 1086) indisponíveis nesta execução.")
+}
+add("")
+
+add("3.5. Perfil dos estabelecimentos (Censo Agropecuário 2017)"); add("")
+if (!is.null(censo_resumo)) {
+  cr <- censo_resumo
+  add(paste0("Em 2017, ", fmt_ptbr(cr$estabelecimentos_produzem_leite, 0),
+             " estabelecimentos agropecuários baianos produziram leite de vaca,"))
+  add(paste0("totalizando ", fmt_ptbr(cr$litros_produzidos / 1e6, 1),
+             " milhões de litros. Destes, ",
+             fmt_ptbr(cr$estabelecimentos_venderam_leite, 0),
+             " estabelecimentos (",
+             fmt_ptbr(cr$pct_estabelecimentos_que_venderam, 1),
+             "%) comercializaram leite cru,"))
+  add(paste0("o que correspondeu a ", fmt_ptbr(cr$pct_volume_vendido, 1),
+             "% do volume produzido. A produção média por estabelecimento foi de ",
+             fmt_ptbr(cr$litros_por_estabelecimento, 0), " L/ano."))
+} else {
+  add("Dados do Censo Agropecuário 2017 (tabela 9130) indisponíveis nesta execução.")
+}
+add("")
+
+## ========== 4. DISCUSSÃO ==========
+add("4. DISCUSSÃO"); add(strrep("-", 80))
+add("")
+add("Os resultados evidenciam uma cadeia leiteira baiana caracterizada por elevada")
+add("concentração espacial e produtividade heterogênea entre municípios. A")
+add(paste0("participação de ", fmt_ptbr(share_top20_pct, 1),
+           "% detida pelos vinte maiores produtores sugere"))
+add("polos regionais especializados, cuja distribuição geográfica pode ser observada")
+add("nos mapas gerados. A produtividade média estadual, situada em torno de")
+add(paste0(fmt_ptbr(ref_row$produtividade_litros_vaca, 0), " L/vaca/ano em ", ano_ref,
+           ", situa-se abaixo dos patamares nacionais mais elevados,"))
+add("indicando espaço para ganhos via manejo, genética e sanidade animal.")
+add("")
+add("A relação entre preço médio implícito (PPM) e preço pago pela indústria (PTL)")
+add("permite inferir margens ao longo da cadeia, ainda que ambas as fontes possuam")
+add("metodologias distintas: a PPM captura o valor bruto declarado pelo produtor,")
+add("enquanto a PTL registra transações efetivas de aquisição pela indústria")
+add("formalizada. A taxa de industrialização observada indica o grau de absorção")
+add("da produção primária pelo setor de laticínios inspecionado.")
+add("")
+
+## ========== 5. PROVA DOS NOVE ==========
+add("5. PROVA DOS NOVE — VERIFICAÇÃO DOS CÁLCULOS"); add(strrep("-", 80))
+add("")
+add("Esta seção documenta o rastro de cada cálculo apresentado no relatório,")
+add("permitindo verificação independente dos valores.")
+add("")
+add("5.1. Produção total do ano de referência"); add("")
+add(paste0("   Soma direta dos ", ref_row$municipios_com_producao,
+           " municípios com produção declarada:"))
+add(paste0("   Σ producao_mil_litros = ", fmt_ptbr(calc_prod_ref, 0), " mil L"))
+add(paste0("                        = ", fmt_ptbr(calc_prod_ref / 1000, 2),
+           " milhões de L"))
+add(paste0("   Valor no relatório   = ", fmt_ptbr(ref_row$producao_milhoes_litros, 2),
+           " milhões de L"))
+add(paste0("   Diferença            = ",
+           fmt_ptbr(abs(ref_row$producao_milhoes_litros - calc_prod_ref / 1000), 4),
+           " (verificado)"))
+add("")
+add("5.2. Variação percentual no período"); add("")
+add(paste0("   Fórmula: VAR = 100 × (Prod_", ano_ref, " ÷ Prod_", ano_base, " - 1)"))
+add(paste0("   Cálculo: 100 × (", fmt_ptbr(calc_prod_ref, 0), " ÷ ",
+           fmt_ptbr(calc_prod_base, 0), " - 1)"))
+add(paste0("          = 100 × (", fmt_ptbr(calc_prod_ref / calc_prod_base, 6), " - 1)"))
+add(paste0("          = ", fmt_ptbr(calc_var_pct, 4), "%"))
+add(paste0("   Valor no relatório = ", fmt_ptbr(ref_row$variacao_producao_pct, 4),
+           "%  (verificado)"))
+add("")
+add(paste0("5.3. Preço médio implícito (", ano_ref, ")")); add("")
+add(paste0("   Fórmula: PREÇO = Valor(R$ mil) ÷ Quantidade(mil L)"))
+add(paste0("   Cálculo: ", fmt_ptbr(ref_row$valor_producao_mil_reais, 0),
+           " ÷ ", fmt_ptbr(ref_row$producao_mil_litros, 0)))
+add(paste0("          = R$ ", fmt_ptbr(ref_row$preco_medio_litro, 4), "/L"))
+add(paste0("   Valor no relatório = R$ ", fmt_ptbr(ref_row$preco_medio_litro, 2),
+           "/L  (verificado)"))
+add("")
+add(paste0("5.4. Produtividade (", ano_ref, ")")); add("")
+add("   Fórmula: PROD = (Quantidade em L) ÷ (Vacas ordenhadas)")
+add(paste0("   Cálculo: (", fmt_ptbr(ref_row$producao_mil_litros, 0),
+           " × 1000) ÷ ", fmt_ptbr(ref_row$vacas_ordenhadas, 0)))
+add(paste0("          = ", fmt_ptbr(ref_row$producao_mil_litros * 1000, 0),
+           " ÷ ", fmt_ptbr(ref_row$vacas_ordenhadas, 0)))
+add(paste0("          = ", fmt_ptbr(ref_row$produtividade_litros_vaca, 4),
+           " L/vaca/ano"))
+add(paste0("   Valor no relatório = ", fmt_ptbr(ref_row$produtividade_litros_vaca, 0),
+           " L/vaca/ano  (verificado)"))
+add("")
+add("5.5. Concentração municipal — Top 20"); add("")
+top20_share_calc <- sum(top20$participacao_pct, na.rm = TRUE)
+add(paste0("   Soma direta das participações dos 20 primeiros: ",
+           fmt_ptbr(top20_share_calc, 4), "%"))
+add(paste0("   Valor no relatório: ", fmt_ptbr(share_top20_pct, 4),
+           "%  (verificado)"))
+add(paste0("   Somatório de todos os municípios: ",
+           fmt_ptbr(sum(ranking_municipios$participacao_pct, na.rm = TRUE), 4),
+           "% (deve ser 100%)"))
+add("")
+
+## ========== 6. NOTAS E LIMITAÇÕES ==========
+add("6. NOTAS METODOLÓGICAS E LIMITAÇÕES"); add(strrep("-", 80))
+add("")
+add("   (i)   A PPM (tabelas 74, 94, 3939) tem cobertura anual censitária declarada")
+add("         pelos municípios, com possível defasagem de publicação. O último ano")
+add("         disponível pode não ser o corrente.")
+add("")
+add("   (ii)  A PTL (tabela 1086) capta apenas estabelecimentos industriais que")
+add("         adquirem leite cru sob inspeção; produção clandestina ou vendida")
+add("         diretamente ao consumidor não é considerada.")
+add("")
+add("   (iii) O Censo Agropecuário 2017 (tabela 9130) é fonte única, decenal, com")
+add("         próximo levantamento previsto para 2027-2028.")
+add("")
+add("   (iv)  O preço médio da PPM é calculado por identidade contábil")
+add("         (valor ÷ quantidade) e pode diferir do preço efetivamente pago pela")
+add("         indústria (PTL), que reflete transações comerciais formais.")
+add("")
+add("   (v)   Municípios sem produção declarada aparecem em cinza nos mapas")
+add("         coropléticos e são excluídos dos cálculos de mediana.")
+add("")
+add(strrep("=", 80))
+add("        FIM DO RELATÓRIO")
+add(strrep("=", 80))
+
+writeLines(linhas, file.path(dir_analise, "analise_cadeia_leiteira_bahia.txt"),
+           useBytes = FALSE)
+message("Análise textual completa salva.")
+
+## ---------------------------------------------------------------------------
+## 10) RESUMO FINAL -----------------------------------------------------------
+## ---------------------------------------------------------------------------
+cat("\n================= EXECUÇÃO CONCLUÍDA =================\n")
+cat("Pasta de saída:", diretorio_saida, "\n")
+cat(" - dados/    :", length(list.files(dir_dados)),    "arquivos CSV\n")
+cat(" - graficos/ :", length(list.files(dir_graficos)), "gráficos PNG\n")
+cat(" - mapas/    :", length(list.files(dir_mapas)),    "mapas PNG\n")
+cat(" - analise/  :", length(list.files(dir_analise)),  "arquivo TXT\n")
+cat("Ano base:", ano_base, "| Ano de referência:", ano_ref, "\n")

@@ -1,0 +1,455 @@
+# ============================================================
+# GERADOR DE PROMPT v5.0
+# Alinhado ao pipeline do script de producao (SIDRA serie temporal)
+# Saidas: Markdown + JSON para LLM gerar scripts R robustos
+# Salvar este arquivo em UTF-8 (sem BOM de preferencia)
+# ============================================================
+
+options(scipen = 999, timeout = 300)
+
+pacotes_gerador <- c(
+  "sidrar", "dplyr", "tidyr", "purrr", "stringr", "cli",
+  "jsonlite", "janitor"
+)
+faltar <- pacotes_gerador[!pacotes_gerador %in% rownames(installed.packages())]
+if (length(faltar) > 0) install.packages(faltar, dependencies = TRUE)
+invisible(lapply(pacotes_gerador, library, character.only = TRUE))
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ------------------------------------------------------------
+# Helpers de input
+# ------------------------------------------------------------
+ler_inteiro <- function(msg, min = -Inf, max = Inf) {
+  repeat {
+    v <- suppressWarnings(as.integer(readline(msg)))
+    if (!is.na(v) && v >= min && v <= max) return(v)
+    cli::cli_alert_danger("Valor invalido.")
+  }
+}
+
+ler_texto <- function(msg, default = NULL) {
+  x <- readline(msg)
+  if (!nzchar(x) && !is.null(default)) return(default)
+  x
+}
+
+menu_seguro <- function(opcoes, title = "Escolha:") {
+  repeat {
+    e <- utils::menu(opcoes, title = title)
+    if (e >= 1 && e <= length(opcoes)) return(e)
+    cli::cli_alert_danger("Opcao invalida.")
+  }
+}
+
+sim_nao <- function(msg) {
+  ler_inteiro(paste0(msg, " (1=Sim, 2=Nao): "), 1, 2) == 1
+}
+
+# ------------------------------------------------------------
+# Observacoes = contrato do script de producao
+# ------------------------------------------------------------
+criar_observacoes_pipeline <- function(cfg) {
+  list(
+    estrutura_script = paste(
+      "Gere UM unico script .R em UTF-8, secoes numeradas:",
+      "0) pacotes (install se faltar) | 1) diretorios | 2) funcoes auxiliares |",
+      "3..N) downloads SIDRA | consolidacao/indicadores | graficos | mapas |",
+      "fontes complementares | analise textual completa | resumo final no console.",
+      "options(scipen=999, timeout=600); set.seed(42)."
+    ),
+    diretorios = paste(
+      "diretorio_base (malhas) e diretorio_saida (projeto).",
+      "Criar subpastas: dados/, graficos/, mapas/, analise/ com dir.create(recursive=TRUE).",
+      "Nunca sobrescrever malhas; apenas ler."
+    ),
+    pacotes = paste(
+      "sidrar, tidyverse, janitor, lubridate, scales, sf, ggspatial, ggrepel.",
+      "conflicted opcional: conflicts_prefer(dplyr::filter, dplyr::select)."
+    ),
+    sidra_download = paste(
+      "NAO montar URL api= como estrategia principal se multi-classific falhar.",
+      "Usar do.call(sidrar::get_sidra, args) com UMA classific por chamada.",
+      "geo.filter com codigo UF (ex. State=29).",
+      "periodos em lista de fallback (ex. 2015:2024, depois 2015:2023...).",
+      "Cada get_sidra em tryCatch; message de progresso; Sys.sleep(1) entre tentativas.",
+      "Salvar sempre CSV bruto em dados/ antes de pivot."
+    ),
+    encoding_colunas = paste(
+      "Apos download: funcao padronizar_colunas_robust() + clean_names().",
+      "Garantir municipio_codigo, ano, variavel_codigo, valor.",
+      "Joins sempre as.character(codigo). filter de categoria por codigo string."
+    ),
+    pivot = paste(
+      "pivot_wider(names_from=variavel_codigo, values_from=valor, names_prefix='var_',",
+      "values_fn=function(x) sum(x, na.rm=TRUE)).",
+      "renomear_se_existir + garantir_colunas + replace_na(0)."
+    ),
+    formulas = paste(
+      "Documentar no codigo e no TXT:",
+      "PROD_L_vaca = (qtd_mil_l * 1000) / vacas_ordenhadas;",
+      "PRECO_impl = valor_mil_reais / qtd_mil_l;",
+      "SHARE_i = 100 * q_i / sum(q);",
+      "VAR_pct = 100 * (q_ref/q_base - 1);",
+      "TX_ind = 100 * industrializado/adquirido.",
+      "Nunca dividir se denominador <= 0 (usar NA_real_)."
+    ),
+    graficos = paste(
+      "tema_grafico() minimal; caption com fonte SIDRA + data_geracao.",
+      "Evolucao (col+line), ranking top N coord_flip, dispersao com medianas,",
+      "fmt_ptbr em labels. ggsave dpi=300 bg=white. Nomes estaveis em graficos/."
+    ),
+    mapas = paste(
+      "CRS de trabalho EPSG:5880 (SIRGAS 2000 Brazil Polyconic).",
+      "Carregar malha zip/shp/gpkg local; fallback API IBGE malhas se ausente.",
+      "st_make_valid + st_transform(5880).",
+      "Join malha x ranking por municipio_codigo; reportar cobertura %.",
+      "Centroidos: st_point_on_surface() no MESMO CRS (nunca drop_geometry antes).",
+      "coord_sf(xlim, ylim) = bbox da UF/municipio com margem ~4%.",
+      "Classes por quantis para coropleticos; na.value cinza.",
+      "Labels: ggrepel::geom_label_repel com x,y projetados, fill branco,",
+      "xlim/ylim = bbox, max.overlaps=Inf, force moderado; limpar sufixo ' - UF'.",
+      "annotation_north_arrow + annotation_scale(unit_category='metric').",
+      "Tema maps: sem eixos, legenda bottom, titulo centralizado.",
+      "Evitar extent explodido e escala absurda."
+    ),
+    malhas_paths = paste0(
+      "Malhas esperadas em diretorio_base: ",
+      paste(cfg$malhas_sugeridas, collapse = ", "),
+      ". Aceitar .zip shapefile via /vsizip/ ou unzip temporario."
+    ),
+    analise_txt = paste(
+      "Escrever analise/*.txt como RELATORIO TECNICO completo:",
+      "1 Introducao | 2 Material e Metodos (tabelas SIDRA, variaveis, nivel geo,",
+      "periodo, malhas, formulas, pacotes) | 3 Resultados (tabelas texto, top N,",
+      "evolucao, industrializacao se houver, censo se houver) | 4 Discussao |",
+      "5 PROVA DOS NOVE (recalcular totais e confrontar com o relatorio) |",
+      "6 Notas e limitacoes. fmt_ptbr; writeLines UTF-8."
+    ),
+    saidas = paste(
+      "dados/: brutos + consolidados + ranking + resumo anual CSV;",
+      "graficos/: PNG 300dpi; mapas/: PNG; analise/: 1 TXT.",
+      "Console final: contagem de arquivos e ano_base/ano_ref."
+    ),
+    qualidade = paste(
+      "Script idempotente, sem input interativo, paths no topo,",
+      "mensagens cat/message por etapa [k/n], stop so se tabela-mae falhar."
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# Coleta interativa
+# ------------------------------------------------------------
+definir_objetivo <- function() {
+  list(
+    titulo = ler_texto("Titulo curto do projeto (ex: cadeia leiteira BA): "),
+    objetivo = ler_texto("Objetivo analitico (1-3 frases): "),
+    tema = ler_texto("Tema/setor (leite, graos, rebanho...): ", "agropecuaria"),
+    uf_nome = ler_texto("Nome da UF/regiao: ", "Bahia"),
+    uf_cod = ler_texto("Codigo UF IBGE (ex 29): ", "29"),
+    ano_ini = ler_inteiro("Ano inicial da serie: ", 1974, 2100),
+    ano_fim = ler_inteiro("Ano final desejado: ", 1974, 2100)
+  )
+}
+
+definir_tabelas <- function() {
+  cli::cli_h2("Tabelas SIDRA")
+  cli::cli_text("Ex.: producao 74; vacas 94; rebanho 3939; PTL 1086; Censo 9130")
+  n <- ler_inteiro("Quantas tabelas? ", 1, 15)
+  tabs <- vector("list", n)
+  for (i in seq_len(n)) {
+    cli::cli_rule(paste("Tabela", i))
+    cod <- ler_texto("Codigo da tabela: ")
+    papel <- menu_seguro(
+      c(
+        "Principal (serie municipal producao/valor)",
+        "Complementar municipal (rebanho, vacas...)",
+        "Estadual temporal (PTL/trimestral)",
+        "Estrutural/censo (estabelecimentos)",
+        "Outra"
+      ),
+      title = "Papel no pipeline:"
+    )
+    vars <- ler_texto("Codigos de variaveis separados por virgula (ex 106,215): ")
+    vars <- str_split(vars, ",")[[1]] %>% str_trim()
+    vars <- vars[nzchar(vars)]
+    classif <- ler_texto("classific (ex c80) ou vazio: ", "")
+    categ <- ler_texto("category (ex 2682) ou vazio/all: ", "")
+    nivel <- menu_seguro(
+      c("City (municipal)", "State (UF)", "Country"),
+      title = "Nivel geo:"
+    )
+    tabs[[i]] <- list(
+      codigo = cod,
+      papel = c("principal", "complementar_mun", "estadual_temporal", "censo", "outra")[papel],
+      variaveis = vars,
+      classific = if (nzchar(classif)) classif else NULL,
+      category = if (nzchar(categ)) categ else NULL,
+      geo = c("City", "State", "Country")[nivel],
+      descricao = ler_texto("Descricao livre da tabela: ", paste("Tabela", cod))
+    )
+  }
+  tabs
+}
+
+definir_calculos <- function() {
+  cli::cli_h2("Indicadores / calculos")
+  ops <- c(
+    "Produtividade (qtd/rebanho ou qtd/vacas)",
+    "Preco implicito (valor/qtd)",
+    "Participacao % municipal",
+    "Variacao % no periodo",
+    "Taxa industrializacao (ind/adq)",
+    "Ranking top N",
+    "Media movel / serie",
+    "Personalizado"
+  )
+  cat(paste0(seq_along(ops), ". ", ops, collapse = "\n"), "\n")
+  nums <- str_split(ler_texto("Numeros separados por virgula: ", "1,2,3,4,6"), ",")[[1]]
+  nums <- suppressWarnings(as.integer(str_trim(nums)))
+  nums <- nums[!is.na(nums) & nums >= 1 & nums <= length(ops)]
+  custom <- NULL
+  if (8 %in% nums) custom <- ler_texto("Descreva calculo personalizado: ")
+  list(escolhidos = ops[nums], personalizado = custom)
+}
+
+definir_resultados <- function() {
+  cli::cli_h2("Produtos de saida (padrao script producao)")
+  ops <- c(
+    "CSV brutos SIDRA",
+    "CSV consolidado municipal + resumo anual + ranking",
+    "Graficos evolucao",
+    "Graficos ranking top N",
+    "Graficos dispersao",
+    "Mapa coropletico producao",
+    "Mapa coropletico produtividade/valor",
+    "Mapa ranking top + labels",
+    "Mapa circulos proporcionais (centroidos)",
+    "Serie PTL/trimestral se houver",
+    "Bloco censo/estrutural se houver",
+    "Relatorio TXT completo + Prova dos 9"
+  )
+  cat(paste0(seq_along(ops), ". ", ops, collapse = "\n"), "\n")
+  cat("Enter = todos\n")
+  raw <- ler_texto("Escolhas: ", paste(seq_along(ops), collapse = ","))
+  nums <- suppressWarnings(as.integer(str_trim(str_split(raw, ",")[[1]])))
+  nums <- nums[!is.na(nums) & nums >= 1 & nums <= length(ops)]
+  list(
+    labels = ops,
+    selecionados = ops[nums]
+  )
+}
+
+definir_paths <- function(meta) {
+  cli::cli_h2("Paths")
+  base_default <- "E:/Documentos/UFBA/ZOOTECNIA/PROJETOS/PROJETO DADOS/base"
+  slug <- gsub("[^a-zA-Z0-9]+", "_", tolower(meta$titulo))
+  slug <- gsub("^_|_$", "", slug)
+  out_default <- file.path(
+    "E:/Documentos/UFBA/ZOOTECNIA/PROJETOS/PROJETO DADOS/searchs/agro",
+    slug
+  )
+  list(
+    diretorio_base = ler_texto(paste0("diretorio_base [", base_default, "]: "), base_default),
+    diretorio_saida = ler_texto(paste0("diretorio_saida [", out_default, "]: "), out_default),
+    malha_mun = ler_texto("Arquivo malha municipal (zip/gpkg/shp): ", "BA_Municipios_2025.zip"),
+    malha_uf = ler_texto("Arquivo malha UF (zip/gpkg/shp): ", "BA_UF_2025.zip")
+  )
+}
+
+# ------------------------------------------------------------
+# Montagem Markdown
+# ------------------------------------------------------------
+montar_markdown <- function(meta, tabs, calcs, resultados, paths, obs) {
+  L <- character(0)
+  a <- function(...) {
+    L <<- c(L, paste0(...))
+  }
+  
+  a("# Prompt para geracao de script R - pipeline SIDRA/IBGE (padrao producao)")
+  a("")
+  a("## Papel do modelo")
+  a("Voce e um engenheiro de dados senior em R. Gere um unico script .R completo,")
+  a("reproduzivel e nao interativo, seguindo obrigatoriamente a arquitetura e a")
+  a("robustez do pipeline de referencia (analise municipal + serie temporal + mapas")
+  a("profissionais + relatorio tecnico com Prova dos Nove).")
+  a("")
+  a("## 1. Contexto")
+  a(sprintf("- **Titulo:** %s", meta$titulo))
+  a(sprintf("- **Objetivo:** %s", meta$objetivo))
+  a(sprintf("- **Tema:** %s", meta$tema))
+  a(sprintf("- **Recorte territorial:** %s (UF IBGE %s)", meta$uf_nome, meta$uf_cod))
+  a(sprintf("- **Serie:** %s-%s (ou ultimo ano disponivel na PPM/SIDRA)", meta$ano_ini, meta$ano_fim))
+  a("")
+  a("## 2. Paths (topo do script)")
+  a(sprintf("- `diretorio_base`: `%s`", paths$diretorio_base))
+  a(sprintf("- `diretorio_saida`: `%s`", paths$diretorio_saida))
+  a(sprintf("- Malha municipal: `%s`", paths$malha_mun))
+  a(sprintf("- Malha UF: `%s`", paths$malha_uf))
+  a("- Subpastas de saida: `dados/`, `graficos/`, `mapas/`, `analise/`")
+  a("")
+  a("## 3. Fontes SIDRA (ordem de implementacao)")
+  for (i in seq_along(tabs)) {
+    t <- tabs[[i]]
+    a(sprintf("### 3.%s Tabela %s - %s", i, t$codigo, t$descricao))
+    a(sprintf("- Papel no pipeline: **%s**", t$papel))
+    a(sprintf("- Variaveis: %s", paste(t$variaveis, collapse = ", ")))
+    a(sprintf("- geo: **%s** | geo.filter State=%s", t$geo, meta$uf_cod))
+    if (!is.null(t$classific)) {
+      a(sprintf("- classific: `%s` | category: `%s`", t$classific, t$category %||% "all"))
+    }
+    a(sprintf("- Periodo preferencial: %s:%s com fallbacks anuais decrescentes", meta$ano_ini, meta$ano_fim))
+    a("")
+  }
+  a("## 4. Calculos / indicadores")
+  for (cc in calcs$escolhidos) a(sprintf("- %s", cc))
+  if (!is.null(calcs$personalizado) && nzchar(calcs$personalizado)) {
+    a(sprintf("- Personalizado: %s", calcs$personalizado))
+  }
+  a("")
+  a("## 5. Resultados obrigatorios")
+  for (s in resultados$selecionados) a(sprintf("- [ ] %s", s))
+  a("")
+  a("## 6. Arquitetura do script (espelhar referencia)")
+  a("```")
+  a("0 Pacotes + options + set.seed")
+  a("1 Diretorios e data_geracao")
+  a("2 Helpers: fmt_ptbr, encoding, padronizar_colunas_robust,")
+  a("  baixar_sidra_simples / baixar_sidra_periodo, carregar_malha,")
+  a("  renomear_se_existir, garantir_colunas, tema_grafico, tema_mapa, salvar_grafico")
+  a("3 Downloads tabelas (brutos CSV)")
+  a("4 Consolidacao, indicadores, ranking, resumo anual")
+  a("5 Graficos PNG")
+  a("6 Mapas PNG (CRS 5880, bbox, centroidos, ggrepel)")
+  a("7 Fontes estaduais/censo se configuradas")
+  a("8 Relatorio TXT (Intro, Metodos, Resultados, Discussao, Prova dos 9, Limitacoes)")
+  a("9 Resumo final console")
+  a("```")
+  a("")
+  a("## 7. Contrato de robustez e qualidade")
+  for (nm in names(obs)) {
+    a(sprintf("### %s", nm))
+    a(obs[[nm]])
+    a("")
+  }
+  a("## 8. Regras finais para o codigo gerado")
+  a("- Nao usar shiny/menus no script de analise.")
+  a("- Comentarios em portugues; arquivo UTF-8.")
+  a("- Se tabela principal falhar: stop(); complementares: warning e segue.")
+  a("- Mapas: nunca plotar labels em WGS84 misturado com geometria projetada.")
+  a("- Relatorio: incluir prova dos 9 numerica reconferindo totais.")
+  a("- Ao final, listar quantos CSV/PNG/TXT foram escritos.")
+  a("")
+  a("## 9. Entrega")
+  a("Responda somente com o script R completo, pronto para source().")
+  paste(L, collapse = "\n")
+}
+
+# ------------------------------------------------------------
+# Montagem JSON
+# ------------------------------------------------------------
+montar_json <- function(meta, tabs, calcs, resultados, paths, obs) {
+  list(
+    prompt_version = "5.0",
+    tipo = "pipeline_sidra_producao_regional",
+    referencia_arquitetural = "script_cadeia_leiteira_bahia",
+    contexto = list(
+      titulo = meta$titulo,
+      objetivo = meta$objetivo,
+      tema = meta$tema,
+      uf_nome = meta$uf_nome,
+      uf_codigo_ibge = meta$uf_cod,
+      ano_inicial = meta$ano_ini,
+      ano_final = meta$ano_fim
+    ),
+    paths = paths,
+    saidas = list(
+      pastas = c("dados", "graficos", "mapas", "analise"),
+      formatos = c("csv", "png", "txt")
+    ),
+    fontes_sidra = tabs,
+    calculos = calcs,
+    resultados = list(
+      selecionados = resultados$selecionados,
+      catalogo = resultados$labels
+    ),
+    pipeline_secoes = c(
+      "pacotes", "diretorios", "helpers", "downloads", "consolidacao",
+      "graficos", "mapas_crs5880", "fontes_extra", "relatorio_prova_dos_nove",
+      "resumo_console"
+    ),
+    mapas = list(
+      crs_trabalho = 5880,
+      centroides = "st_point_on_surface",
+      labels = "ggrepel_label_repel_bbox",
+      extras = c("north_arrow", "scale_metric", "quantis_coropleticos")
+    ),
+    relatorio = list(
+      secoes = c(
+        "introducao", "material_metodos", "resultados",
+        "discussao", "prova_dos_nove", "limitacoes"
+      )
+    ),
+    observacoes = obs,
+    instrucao_llm = paste(
+      "Gerar um unico script R nao interativo seguindo pipeline_secoes,",
+      "observacoes e paths; saida somente codigo R."
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+gerador_prompt_v5 <- function() {
+  cat("\014")
+  cli::cli_h1("GERADOR DE PROMPT v5 - padrao script de producao SIDRA")
+  cli::cli_rule()
+  
+  meta <- definir_objetivo()
+  tabs <- definir_tabelas()
+  calcs <- definir_calculos()
+  resultados <- definir_resultados()
+  paths <- definir_paths(meta)
+  
+  cfg_obs <- list(
+    malhas_sugeridas = c(paths$malha_mun, paths$malha_uf)
+  )
+  obs <- criar_observacoes_pipeline(cfg_obs)
+  
+  md <- montar_markdown(meta, tabs, calcs, resultados, paths, obs)
+  js <- montar_json(meta, tabs, calcs, resultados, paths, obs)
+  js_txt <- jsonlite::toJSON(js, pretty = TRUE, auto_unbox = TRUE, null = "null")
+  
+  cli::cli_h2("Formato de saida")
+  fmt <- ler_inteiro("1=Markdown  2=JSON  3=Ambos: ", 1, 3)
+  
+  slug <- gsub("[^a-zA-Z0-9]+", "_", tolower(meta$titulo))
+  slug <- gsub("^_|_$", "", slug)
+  default_name <- paste0("prompt_", slug, "_v5")
+  
+  if (fmt %in% c(1, 3)) {
+    cat("\n=== MARKDOWN (preview 2000 chars) ===\n")
+    cat(substr(md, 1, 2000), if (nchar(md) > 2000) "\n...\n" else "\n")
+    if (sim_nao("Salvar Markdown?")) {
+      fn <- ler_texto("Nome base: ", default_name)
+      writeLines(md, paste0(fn, ".md"), useBytes = FALSE)
+      cli::cli_alert_success(paste0("Salvo: ", fn, ".md"))
+    }
+  }
+  if (fmt %in% c(2, 3)) {
+    cat("\n=== JSON (preview 1500 chars) ===\n")
+    cat(substr(js_txt, 1, 1500), if (nchar(js_txt) > 1500) "\n...\n" else "\n")
+    if (sim_nao("Salvar JSON?")) {
+      fn <- ler_texto("Nome base: ", default_name)
+      writeLines(js_txt, paste0(fn, ".json"), useBytes = FALSE)
+      cli::cli_alert_success(paste0("Salvo: ", fn, ".json"))
+    }
+  }
+  
+  invisible(list(markdown = md, json = js, json_text = js_txt))
+}
+
+# Executar
+gerador_prompt_v5()

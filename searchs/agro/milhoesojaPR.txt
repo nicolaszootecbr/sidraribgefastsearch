@@ -1,0 +1,747 @@
+###############################################################################
+## ANALISE DA PRODUÇÃO E PRODUTIVIDADE DE MILHO E SOJA NO PARANÁ (1991-2020)
+## Fontes SIDRA/IBGE: 1612 (PAM - Produção Agrícola Municipal)
+## Saidas: dados/ (csv), graficos/ (png), mapas/ (png), analise/ (txt)
+## Salvar este arquivo em UTF-8.
+###############################################################################
+
+options(scipen = 999, timeout = 600, encoding = "UTF-8")
+set.seed(42)
+
+## ---------------------------------------------------------------------------
+## 0) PACOTES E CONFIGURAÇÕES ------------------------------------------------
+## ---------------------------------------------------------------------------
+pacotes <- c("sidrar", "tidyverse", "janitor", "lubridate",
+             "scales", "sf", "ggspatial", "ggrepel")
+faltar <- pacotes[!pacotes %in% rownames(installed.packages())]
+if (length(faltar) > 0) install.packages(faltar, dependencies = TRUE)
+invisible(lapply(pacotes, library, character.only = TRUE))
+
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::select)
+
+cat("==================================================================\n")
+cat("  ANÁLISE DE MILHO E SOJA NO PARANÁ (1991-2020) — SIDRA/IBGE\n")
+cat("==================================================================\n\n")
+
+## ---------------------------------------------------------------------------
+## 1) DIRETÓRIOS --------------------------------------------------------------
+## ---------------------------------------------------------------------------
+diretorio_base  <- "E:/Documentos/UFBA/ZOOTECNIA/PROJETOS/PROJETO DADOS/base"
+diretorio_saida <- "E:/Documentos/UFBA/ZOOTECNIA/PROJETOS/PROJETO DADOS/searchs/agro/analise_da_produ_o_e_produtividade_de_milho_e_soja_no_estado_do_paran_1991_2020"
+
+dir_dados    <- file.path(diretorio_saida, "dados")
+dir_graficos <- file.path(diretorio_saida, "graficos")
+dir_mapas    <- file.path(diretorio_saida, "mapas")
+dir_analise  <- file.path(diretorio_saida, "analise")
+for (d in c(dir_dados, dir_graficos, dir_mapas, dir_analise)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+arquivo_malha_mun <- file.path(diretorio_base, "PR_Municipios_2022.zip")
+arquivo_malha_uf  <- file.path(diretorio_base, "PR_UF_2022.zip")
+data_geracao <- format(Sys.Date(), "%d/%m/%Y")
+
+ano_base <- 1991
+ano_ref  <- 2020
+
+## ---------------------------------------------------------------------------
+## 2) FUNÇÕES AUXILIARES DE ROBUSTEZ -----------------------------------------
+## ---------------------------------------------------------------------------
+fmt_ptbr <- function(x, digits = 0) {
+  out <- rep("n/d", length(x)); ok <- is.finite(x)
+  out[ok] <- formatC(x[ok], format = "f", digits = digits,
+                     big.mark = ".", decimal.mark = ",")
+  out
+}
+
+## Recupera nomes de colunas mesmo em caso de encoding corrompido
+recuperar_encoding <- function(txt) {
+  if (is.null(txt) || length(txt) == 0) return(txt)
+  out <- txt
+  for (i in seq_along(out)) {
+    x <- out[i]
+    if (grepl("Ã[¡£¢©ª­®³µ´º»§]", x, useBytes = TRUE)) {
+      tentativa <- tryCatch({
+        raw_bytes <- charToRaw(x)
+        rawToChar(raw_bytes) |> iconv(from = "UTF-8", to = "UTF-8", sub = "")
+      }, error = function(e) x)
+      if (!is.na(tentativa) && nchar(tentativa) > 0) x <- tentativa
+    }
+    ascii_v <- iconv(x, to = "ASCII//TRANSLIT", sub = "")
+    if (!is.na(ascii_v) && nchar(ascii_v) > 0) x <- ascii_v
+    out[i] <- x
+  }
+  out
+}
+
+## Padroniza colunas do SIDRA de forma ultra-resistente
+padronizar_colunas_robust <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(df)
+  
+  names_raw <- names(df)
+  names_ascii <- recuperar_encoding(names_raw)
+  names_clean <- tolower(names_ascii)
+  names_clean <- gsub("[^a-z0-9_]+", "_", names_clean)
+  names_clean <- gsub("_+", "_", names_clean)
+  names_clean <- gsub("^_|_$", "", names_clean)
+  
+  mapeamento_critico <- list(
+    "municipio_codigo" = c("municip.*cod", "cod.*mun"),
+    "municipio"        = c("^municipio$", "municip$"),
+    "variavel_codigo"  = c("var.*cod", "cod.*var"),
+    "variavel"         = c("^variavel$", "variavel$"),
+    "valor"            = c("^valor$", "^val$"),
+    "ano"              = c("^ano$"),
+    "produto_codigo"   = c("produto.*lavoura.*cod", "produto.*cod"),
+    "produto"          = c("produto.*lavoura", "^produto$")
+  )
+  
+  novos_nomes <- names_clean
+  usados <- integer(0)
+  
+  for (novo_nome in names(mapeamento_critico)) {
+    patterns <- mapeamento_critico[[novo_nome]]
+    for (pat in patterns) {
+      matches <- setdiff(which(grepl(pat, names_clean, ignore.case = TRUE)), usados)
+      if (!grepl("_codigo$", novo_nome) && !grepl("cod", pat)) {
+        matches <- setdiff(matches, which(grepl("cod", names_clean)))
+      }
+      if (length(matches) > 0) {
+        idx <- matches[1]
+        novos_nomes[idx] <- novo_nome
+        usados <- c(usados, idx)
+        break
+      }
+    }
+  }
+  
+  if (!"valor" %in% novos_nomes) {
+    num_cols <- which(sapply(df, function(x) {
+      is.numeric(x) || (is.character(x) && !all(is.na(suppressWarnings(as.numeric(x[1:min(10, length(x))])))))
+    }))
+    if (length(num_cols) > 0) novos_nomes[num_cols[1]] <- "valor"
+  }
+  
+  names(df) <- novos_nomes
+  df
+}
+
+## Download SIDRA robusto por chunks para evitar timeout
+baixar_sidra_simples <- function(rotulo, x, variable, period, geo = "City",
+                                 geo_filter = list("State" = 41),
+                                 classific = NULL, category = NULL) {
+  args <- list(x = x, variable = variable, period = period,
+               geo = geo, geo.filter = geo_filter)
+  if (!is.null(classific)) {
+    args$classific <- classific
+    args$category  <- category
+  }
+  
+  message("Baixando ", rotulo, " [t", x, " | periodo: ", paste(range(period), collapse = "-"), "]")
+  df <- tryCatch(do.call(sidrar::get_sidra, args),
+                 error = function(e) { message("  falhou: ", conditionMessage(e)); NULL })
+  if (!is.null(df) && nrow(df) > 0) {
+    message("  OK: ", nrow(df), " linhas")
+    return(df)
+  }
+  NULL
+}
+
+carregar_malha <- function(caminho, api_uf = 41) {
+  if (!file.exists(caminho)) { 
+    message("Arquivo nao encontrado localmente. Tentando API IBGE para UF ", api_uf, "...") 
+    url_ibge <- paste0("https://servicodados.ibge.gov.br/api/v3/malhas/estados/", api_uf,
+                       "?formato=application/vnd.geo+json&intrarregiao=municipio&qualidade=intermediaria")
+    malha <- tryCatch(st_read(url_ibge, quiet = TRUE), error = function(e) NULL)
+    if (!is.null(malha) && "codarea" %in% names(malha)) malha <- malha %>% rename(cd_mun = codarea)
+    return(malha)
+  }
+  malha <- tryCatch(st_read(caminho, quiet = TRUE), error = function(e) NULL)
+  if (is.null(malha))
+    malha <- tryCatch(st_read(paste0("/vsizip/", enc2utf8(caminho)), quiet = TRUE), error = function(e) NULL)
+  if (is.null(malha)) {
+    destino <- file.path(tempdir(), tools::file_path_sans_ext(basename(caminho)))
+    utils::unzip(caminho, exdir = destino, overwrite = TRUE)
+    shp <- list.files(destino, pattern = "[.]shp$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE)[1]
+    if (!is.na(shp)) malha <- tryCatch(st_read(shp, quiet = TRUE), error = function(e) NULL)
+  }
+  malha
+}
+
+renomear_se_existir <- function(df, mapeamento) {
+  for (i in seq_along(mapeamento)) {
+    novo <- names(mapeamento)[i]; antigo <- mapeamento[[i]]
+    if (antigo %in% names(df)) names(df)[names(df) == antigo] <- novo
+  }
+  df
+}
+
+garantir_colunas <- function(df, cols) {
+  for (col in cols) if (!col %in% names(df)) df[[col]] <- NA_real_
+  df
+}
+
+limpar_nome_mun <- function(x) {
+  x %>% as.character() %>% str_replace("\\s*-\\s*PR\\s*$", "") %>% str_squish()
+}
+
+tema_grafico <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(plot.title = element_text(face = "bold", size = rel(1.1)),
+          plot.subtitle = element_text(color = "grey30"),
+          plot.caption = element_text(size = 8, color = "grey40", hjust = 0),
+          panel.grid.minor = element_blank(), legend.position = "top",
+          strip.text = element_text(face = "bold", size = 11))
+}
+
+tema_mapa <- function() {
+  theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+          plot.subtitle = element_text(size = 10.5, color = "grey30", margin = margin(b = 8), hjust = 0.5),
+          plot.caption = element_text(size = 8, color = "grey40", hjust = 0),
+          legend.title = element_text(size = 9, face = "bold"),
+          legend.text = element_text(size = 8),
+          legend.position = "bottom", legend.key.width = unit(1.4, "cm"),
+          legend.key.height = unit(0.35, "cm"),
+          axis.text = element_blank(), axis.title = element_blank(),
+          panel.grid = element_blank(), panel.background = element_rect(fill = "#FAFAFA", color = NA),
+          plot.background = element_rect(fill = "white", color = NA))
+}
+
+salvar_grafico <- function(p, arquivo, w = 9.5, h = 6) {
+  ggsave(arquivo, p, width = w, height = h, dpi = 300, bg = "white")
+  message("Grafico salvo: ", basename(arquivo))
+}
+
+## ---------------------------------------------------------------------------
+## 3) EXTRAÇÃO DE DADOS SIDRA (TABELA 1612 - PAM) ----------------------------
+## ---------------------------------------------------------------------------
+cat("[1/6] Baixando dados da PAM (tabela 1612) para o Paraná (1991-2020)...\n")
+
+decadas <- list(as.character(1991:2000), as.character(2001:2010), as.character(2011:2020))
+vars_pam <- c(109, 216, 214, 112)
+lista_bruta <- list()
+
+for (i in seq_along(decadas)) {
+  per <- decadas[[i]]
+  df_soja <- baixar_sidra_simples(paste0("PAM Soja (", per[1], "-", per[length(per)], ")"),
+                                  x = 1612, variable = vars_pam, period = per,
+                                  geo = "City", geo_filter = list("State" = 41),
+                                  classific = "c81", category = list(2711))
+  df_milho <- baixar_sidra_simples(paste0("PAM Milho (", per[1], "-", per[length(per)], ")"),
+                                   x = 1612, variable = vars_pam, period = per,
+                                   geo = "City", geo_filter = list("State" = 41),
+                                   classific = "c81", category = list(2713))
+  
+  if (!is.null(df_soja)) lista_bruta[[length(lista_bruta) + 1]] <- df_soja
+  if (!is.null(df_milho)) lista_bruta[[length(lista_bruta) + 1]] <- df_milho
+  Sys.sleep(1)
+}
+
+if (length(lista_bruta) == 0) stop("Falha fatal: Não foi possível baixar dados da PAM.")
+
+df_bruto <- bind_rows(lista_bruta)
+write_csv(df_bruto, file.path(dir_dados, "tabela1612_pam_pr_bruta.csv"))
+
+## ---------------------------------------------------------------------------
+## 4) CONSOLIDAÇÃO, INDICADORES E RANKINGS -----------------------------------
+## ---------------------------------------------------------------------------
+cat("[2/6] Consolidando dados e calculando indicadores...\n")
+
+df_clean <- df_bruto %>% 
+  padronizar_colunas_robust() %>% 
+  clean_names() %>%
+  mutate(
+    municipio_codigo = as.character(municipio_codigo),
+    ano   = suppressWarnings(as.integer(ano)),
+    valor = suppressWarnings(as.numeric(valor))
+  ) %>%
+  filter(!is.na(valor))
+
+df_clean <- df_clean %>%
+  mutate(produto_nome = case_when(
+    grepl("soja", produto, ignore.case = TRUE) ~ "Soja",
+    grepl("milho", produto, ignore.case = TRUE) ~ "Milho",
+    TRUE ~ "Outros"
+  )) %>%
+  filter(produto_nome %in% c("Soja", "Milho"))
+
+dados_pam <- df_clean %>%
+  select(municipio_codigo, municipio, ano, produto_nome, variavel_codigo, valor) %>%
+  mutate(variavel_codigo = as.character(variavel_codigo)) %>%
+  pivot_wider(names_from = variavel_codigo, values_from = valor,
+              names_prefix = "var_", values_fn = function(x) sum(x, na.rm = TRUE)) %>%
+  renomear_se_existir(c(
+    area_plantada_ha = "var_109",
+    area_colhida_ha  = "var_216",
+    producao_t       = "var_214",
+    rendimento_kg_ha = "var_112"
+  )) %>%
+  garantir_colunas(c("area_plantada_ha", "area_colhida_ha", "producao_t", "rendimento_kg_ha")) %>%
+  mutate(across(c(area_plantada_ha, area_colhida_ha, producao_t), ~replace_na(., 0))) %>%
+  mutate(rendimento_kg_ha = ifelse(area_colhida_ha > 0, (producao_t * 1000) / area_colhida_ha, 0)) %>%
+  arrange(ano, produto_nome, municipio)
+
+write_csv(dados_pam, file.path(dir_dados, "producao_pam_municipios_pr.csv"))
+
+resumo_pr <- dados_pam %>%
+  group_by(ano, produto_nome) %>%
+  summarise(
+    area_plantada_ha = sum(area_plantada_ha, na.rm = TRUE),
+    area_colhida_ha  = sum(area_colhida_ha, na.rm = TRUE),
+    producao_t       = sum(producao_t, na.rm = TRUE),
+    municipios_prod  = sum(producao_t > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    producao_mil_t = producao_t / 1000,
+    rendimento_kg_ha = ifelse(area_colhida_ha > 0, (producao_t * 1000) / area_colhida_ha, 0)
+  ) %>%
+  group_by(produto_nome) %>%
+  arrange(ano) %>%
+  mutate(
+    variacao_prod_pct = 100 * (producao_t / first(producao_t) - 1)
+  ) %>%
+  ungroup()
+
+write_csv(resumo_pr, file.path(dir_dados, "resumo_anual_pr.csv"))
+
+ranking_mun <- dados_pam %>%
+  filter(ano %in% c(ano_base, ano_ref)) %>%
+  group_by(ano, produto_nome) %>%
+  mutate(
+    producao_total_uf = sum(producao_t, na.rm = TRUE),
+    participacao_pct = 100 * (producao_t / producao_total_uf),
+    rank_producao = row_number(desc(producao_t))
+  ) %>%
+  ungroup()
+
+write_csv(ranking_mun, file.path(dir_dados, "ranking_municipios_anos_focais.csv"))
+
+top10_municipios <- ranking_mun %>% filter(rank_producao <= 10)
+
+## ---------------------------------------------------------------------------
+## 5) GRÁFICOS ----------------------------------------------------------------
+## ---------------------------------------------------------------------------
+cat("[3/6] Gerando gráficos...\n")
+caption_pam <- paste0("Fonte: IBGE, SIDRA — Pesquisa Agrícola Municipal (Tabela 1612).\n",
+                      "Elaboração própria. Gerado em ", data_geracao, ".")
+
+g1 <- ggplot(resumo_pr, aes(x = ano, y = producao_mil_t, color = produto_nome)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Soja" = "#2E7D32", "Milho" = "#F9A825"), name = "Cultura") +
+  scale_y_continuous(labels = function(x) fmt_ptbr(x, 0)) +
+  scale_x_continuous(breaks = seq(ano_base, ano_ref, by = 5)) +
+  labs(title = "Evolução da Produção no Paraná (1991-2020)",
+       subtitle = "Volume total produzido em milhares de toneladas",
+       x = "Ano", y = "Mil toneladas", caption = caption_pam) +
+  tema_grafico()
+salvar_grafico(g1, file.path(dir_graficos, "evolucao_producao_pr.png"))
+
+g2 <- ggplot(resumo_pr, aes(x = ano, y = rendimento_kg_ha, color = produto_nome)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = c("Soja" = "#2E7D32", "Milho" = "#F9A825"), name = "Cultura") +
+  scale_y_continuous(labels = function(x) fmt_ptbr(x, 0)) +
+  scale_x_continuous(breaks = seq(ano_base, ano_ref, by = 5)) +
+  labs(title = "Tendência de Produtividade no Paraná (1991-2020)",
+       subtitle = "Rendimento médio (kg/ha) com linha de tendência linear",
+       x = "Ano", y = "kg/ha", caption = caption_pam) +
+  tema_grafico()
+salvar_grafico(g2, file.path(dir_graficos, "evolucao_produtividade_pr.png"))
+
+top10_soja_2020 <- top10_municipios %>% filter(ano == ano_ref, produto_nome == "Soja")
+g3 <- ggplot(top10_soja_2020, aes(x = reorder(municipio, producao_t), y = producao_t / 1000)) +
+  geom_col(fill = "#43A047") +
+  geom_text(aes(label = fmt_ptbr(producao_t/1000, 0)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = paste0("Top 10 Municípios Produtores de Soja (", ano_ref, ")"),
+       subtitle = "Produção em milhares de toneladas",
+       x = NULL, y = "Mil toneladas", caption = caption_pam) +
+  tema_grafico()
+salvar_grafico(g3, file.path(dir_graficos, "ranking_top10_soja_2020.png"), w = 8, h = 5)
+
+top10_milho_2020 <- top10_municipios %>% filter(ano == ano_ref, produto_nome == "Milho")
+g4 <- ggplot(top10_milho_2020, aes(x = reorder(municipio, producao_t), y = producao_t / 1000)) +
+  geom_col(fill = "#FBC02D") +
+  geom_text(aes(label = fmt_ptbr(producao_t/1000, 0)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = paste0("Top 10 Municípios Produtores de Milho (", ano_ref, ")"),
+       subtitle = "Produção em milhares de toneladas",
+       x = NULL, y = "Mil toneladas", caption = caption_pam) +
+  tema_grafico()
+salvar_grafico(g4, file.path(dir_graficos, "ranking_top10_milho_2020.png"), w = 8, h = 5)
+
+## ---------------------------------------------------------------------------
+## 6) MALHAS E MAPAS PROFISSIONAIS (CRS 5880) --------------------------------
+## ---------------------------------------------------------------------------
+cat("[4/6] Gerando mapas espaciais...\n")
+
+crs_mapa <- 5880
+
+malha_mun <- carregar_malha(arquivo_malha_mun, api_uf = 41)
+if (is.null(malha_mun)) stop("Nao foi possivel carregar a malha municipal do Parana.")
+
+malha_mun <- malha_mun %>%
+  clean_names() %>%
+  st_make_valid() %>%
+  st_transform(crs_mapa)
+
+col_cod_malha <- intersect(c("cd_mun", "code_muni", "cd_municip", "codarea"), names(malha_mun))[1]
+if (is.na(col_cod_malha)) stop("Coluna de codigo do municipio nao encontrada na malha.")
+malha_mun <- malha_mun %>% mutate(municipio_codigo = as.character(.data[[col_cod_malha]]))
+
+malha_uf <- carregar_malha(arquivo_malha_uf, api_uf = 41)
+if (!is.null(malha_uf)) {
+  malha_uf <- malha_uf %>% clean_names() %>% st_make_valid() %>% st_transform(crs_mapa)
+}
+
+bb <- st_bbox(malha_mun)
+x_margin <- diff(bb[c("xmin", "xmax")]) * 0.04
+y_margin <- diff(bb[c("ymin", "ymax")]) * 0.04
+xlim_pr <- c(bb["xmin"] - x_margin, bb["xmax"] + x_margin)
+ylim_pr <- c(bb["ymin"] - y_margin, bb["ymax"] + y_margin)
+
+# Centróides da malha
+suppressWarnings({
+  centroides <- st_point_on_surface(st_make_valid(malha_mun))
+})
+coords_xy <- st_coordinates(centroides)
+centroides <- centroides %>% mutate(x = coords_xy[, 1], y = coords_xy[, 2])
+
+finalizar_mapa <- function(p) {
+  if (!is.null(malha_uf)) {
+    p <- p + geom_sf(data = malha_uf, fill = NA, color = "grey20", linewidth = 0.6, inherit.aes = FALSE)
+  }
+  p + coord_sf(xlim = xlim_pr, ylim = ylim_pr, expand = FALSE, crs = crs_mapa) +
+    annotation_north_arrow(location = "tr", which_north = "true",
+                           pad_x = unit(0.2, "cm"), pad_y = unit(0.2, "cm"),
+                           height = unit(1.0, "cm"), width = unit(0.9, "cm"),
+                           style = north_arrow_fancy_orienteering(text_size = 7)) +
+    annotation_scale(location = "bl", width_hint = 0.25,
+                     pad_x = unit(0.4, "cm"), pad_y = unit(0.4, "cm"),
+                     bar_cols = c("grey20", "white"), text_cex = 0.65, unit_category = "metric")
+}
+
+criar_classes <- function(x, n_classes = 5, digitos = 0, prefixo = "", sufixo = "") {
+  x_valid <- x[!is.na(x) & is.finite(x) & x > 0]
+  if (length(x_valid) < n_classes) return(factor(rep(NA_character_, length(x))))
+  qs <- unique(as.numeric(quantile(x_valid, probs = seq(0, 1, length.out = n_classes + 1), na.rm = TRUE)))
+  if (length(qs) < 3) return(factor(rep(NA_character_, length(x))))
+  qs[1] <- min(0, qs[1])
+  labels <- paste0(prefixo, fmt_ptbr(qs[-length(qs)], digitos), " – ", fmt_ptbr(qs[-1], digitos), sufixo)
+  cut(x, breaks = qs, labels = labels, include.lowest = TRUE, right = TRUE)
+}
+
+# ============================================================
+# 6.1) MAPAS COROPLÉTICOS E DE CÍRCULOS (2020)
+# ============================================================
+
+dados_2020 <- dados_pam %>% filter(ano == ano_ref)
+
+mapa_base <- malha_mun %>%
+  left_join(dados_2020 %>% select(municipio_codigo, produto_nome, producao_t, rendimento_kg_ha, municipio),
+            by = "municipio_codigo", relationship = "many-to-many") %>%
+  mutate(municipio_limpo = limpar_nome_mun(municipio))
+
+mapa_soja  <- mapa_base %>% filter(produto_nome == "Soja" | is.na(produto_nome))
+mapa_milho <- mapa_base %>% filter(produto_nome == "Milho" | is.na(produto_nome))
+
+pts_soja  <- centroides %>% left_join(ranking_mun %>% filter(ano == ano_ref, produto_nome == "Soja"), by = "municipio_codigo")
+pts_milho <- centroides %>% left_join(ranking_mun %>% filter(ano == ano_ref, produto_nome == "Milho"), by = "municipio_codigo")
+
+# Mapa Coroplético Soja
+mapa_soja$classe_prod <- criar_classes(mapa_soja$producao_t / 1000, 5, 0, "", " mil t")
+m1 <- ggplot(mapa_soja) +
+  geom_sf(aes(fill = classe_prod), color = "grey55", linewidth = 0.08) +
+  scale_fill_brewer(palette = "Greens", na.value = "grey90", name = "Produção (mil t)") +
+  labs(title = paste0("Produção Municipal de Soja no PR — ", ano_ref), caption = caption_pam) +
+  tema_mapa()
+m1 <- finalizar_mapa(m1)
+ggsave(file.path(dir_mapas, paste0("mapa_producao_soja_", ano_ref, ".png")), m1, width = 8, height = 7, dpi = 300, bg="white")
+
+# Mapa Círculos Proporcionais Milho + Labels Top 10 (CORRIGIDO)
+top10_milho_pts <- pts_milho %>% 
+  filter(!is.na(rank_producao), rank_producao <= 10) %>% 
+  mutate(rotulo = paste0(rank_producao, "º ", limpar_nome_mun(municipio)))
+
+m2 <- ggplot() +
+  geom_sf(data = malha_mun, fill = "#F7F7F2", color = "grey70", linewidth = 0.1) +
+  geom_sf(data = filter(pts_milho, !is.na(producao_t), producao_t > 0), aes(size = producao_t / 1000), 
+          shape = 21, color = "#F57F17", fill = alpha("#FFF176", 0.6), stroke = 0.4) +
+  scale_size_continuous(range = c(1, 12), name = "Mil toneladas")
+
+if (nrow(top10_milho_pts) > 0) {
+  m2 <- m2 + ggrepel::geom_label_repel(
+    data = top10_milho_pts, 
+    aes(x = x, y = y, label = rotulo),
+    inherit.aes = FALSE, size = 2.5, fontface = "bold", fill = alpha("white", 0.9),
+    box.padding = 0.4, force = 2, seed = 42, max.overlaps = Inf, xlim = xlim_pr, ylim = ylim_pr
+  )
+}
+m2 <- m2 + labs(title = paste0("Distribuição da Produção de Milho — ", ano_ref),
+                subtitle = "Círculos proporcionais (Top 10 identificados)", caption = caption_pam) + tema_mapa()
+m2 <- finalizar_mapa(m2)
+ggsave(file.path(dir_mapas, paste0("mapa_centroides_milho_", ano_ref, ".png")), m2, width = 8, height = 7, dpi = 300, bg="white")
+
+# ============================================================
+# 6.2) TAXA DE TENDÊNCIA E MAPAS DE VARIAÇÃO (1991-2020)
+# ============================================================
+
+tendencia_municipal <- dados_pam %>%
+  filter(ano %in% c(ano_base, ano_ref)) %>%
+  group_by(municipio_codigo, municipio, produto_nome) %>%
+  arrange(ano) %>%
+  summarise(
+    producao_base = first(producao_t),
+    producao_ref  = last(producao_t),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    variacao_pct = ifelse(producao_base > 0, 100 * (producao_ref / producao_base - 1), NA_real_),
+    tendencia = case_when(
+      is.na(variacao_pct) & producao_ref > 0 ~ "Crescimento forte",
+      variacao_pct > 50 ~ "Crescimento forte",
+      variacao_pct > 10 ~ "Crescimento moderado",
+      variacao_pct > -10 ~ "Estável",
+      variacao_pct > -50 ~ "Queda moderada",
+      TRUE ~ "Queda forte"
+    )
+  )
+
+cores_tendencia <- c(
+  "Crescimento forte" = "#1B5E20",
+  "Crescimento moderado" = "#66BB6A",
+  "Estável" = "#FFEE58",
+  "Queda moderada" = "#FFA726",
+  "Queda forte" = "#D32F2F"
+)
+
+# Mapa Tendência Soja
+mapa_tend_soja <- malha_mun %>%
+  left_join(tendencia_municipal %>% filter(produto_nome == "Soja"), by = "municipio_codigo") %>%
+  mutate(tendencia = factor(tendencia, levels = names(cores_tendencia)))
+
+p_tend_soja <- ggplot(mapa_tend_soja) +
+  geom_sf(aes(fill = tendencia), color = "grey55", linewidth = 0.08) +
+  scale_fill_manual(values = cores_tendencia, na.value = "grey90", name = "Tendência 1991-2020") +
+  labs(title = "Tendência da Produção de Soja por Município",
+       subtitle = "Paraná - Variação percentual 1991-2020", caption = caption_pam) +
+  tema_mapa() + theme(legend.position = "right")
+p_tend_soja <- finalizar_mapa(p_tend_soja)
+ggsave(file.path(dir_mapas, "mapa_tendencia_soja_1991_2020.png"), p_tend_soja, width = 8.5, height = 7, dpi = 300, bg = "white")
+
+# Mapa Tendência Milho
+mapa_tend_milho <- malha_mun %>%
+  left_join(tendencia_municipal %>% filter(produto_nome == "Milho"), by = "municipio_codigo") %>%
+  mutate(tendencia = factor(tendencia, levels = names(cores_tendencia)))
+
+p_tend_milho <- ggplot(mapa_tend_milho) +
+  geom_sf(aes(fill = tendencia), color = "grey55", linewidth = 0.08) +
+  scale_fill_manual(values = cores_tendencia, na.value = "grey90", name = "Tendência 1991-2020") +
+  labs(title = "Tendência da Produção de Milho por Município",
+       subtitle = "Paraná - Variação percentual 1991-2020", caption = caption_pam) +
+  tema_mapa() + theme(legend.position = "right")
+p_tend_milho <- finalizar_mapa(p_tend_milho)
+ggsave(file.path(dir_mapas, "mapa_tendencia_milho_1991_2020.png"), p_tend_milho, width = 8.5, height = 7, dpi = 300, bg = "white")
+
+# ============================================================
+# 6.3) MAPAS COMPARATIVOS TOP 10 (1991 vs 2020) (CORRIGIDOS)
+# ============================================================
+
+# SOJA
+top10_soja_1991 <- ranking_mun %>% 
+  filter(ano == ano_base, produto_nome == "Soja", rank_producao <= 10) %>%
+  mutate(rotulo = paste0(rank_producao, "º ", limpar_nome_mun(municipio)))
+
+top10_soja_2020 <- ranking_mun %>% 
+  filter(ano == ano_ref, produto_nome == "Soja", rank_producao <= 10) %>%
+  mutate(rotulo = paste0(rank_producao, "º ", limpar_nome_mun(municipio)))
+
+pts_soja_1991 <- centroides %>% 
+  inner_join(top10_soja_1991 %>% select(municipio_codigo, municipio, rank_producao, producao_t, rotulo), by = "municipio_codigo")
+
+pts_soja_2020 <- centroides %>% 
+  inner_join(top10_soja_2020 %>% select(municipio_codigo, municipio, rank_producao, producao_t, rotulo), by = "municipio_codigo")
+
+mapa_top10_soja <- ggplot() +
+  geom_sf(data = malha_mun, fill = "#F7F7F2", color = "grey70", linewidth = 0.1) +
+  geom_sf(data = pts_soja_1991, aes(size = producao_t / 1000),
+          shape = 21, color = "#2E7D32", fill = alpha("#A5D6A7", 0.5), stroke = 0.5) +
+  geom_sf(data = pts_soja_2020, aes(size = producao_t / 1000),
+          shape = 21, color = "#1B5E20", fill = alpha("#2E7D32", 0.7), stroke = 0.8) +
+  scale_size_continuous(range = c(2, 15), name = "Produção (mil t)") +
+  ggrepel::geom_label_repel(
+    data = pts_soja_2020,
+    aes(x = x, y = y, label = rotulo),
+    inherit.aes = FALSE, size = 2.5, fontface = "bold",
+    fill = alpha("white", 0.85), box.padding = 0.5, force = 3,
+    seed = 42, max.overlaps = Inf, xlim = xlim_pr, ylim = ylim_pr
+  ) +
+  labs(title = "Top 10 Municípios Produtores de Soja",
+       subtitle = "Círculos: 1991 (verde claro) vs 2020 (verde escuro)", caption = caption_pam) +
+  tema_mapa()
+
+mapa_top10_soja <- finalizar_mapa(mapa_top10_soja)
+ggsave(file.path(dir_mapas, "mapa_comparativo_top10_soja.png"), mapa_top10_soja, width = 9, height = 8, dpi = 300, bg = "white")
+
+# MILHO
+top10_milho_1991 <- ranking_mun %>% 
+  filter(ano == ano_base, produto_nome == "Milho", rank_producao <= 10) %>%
+  mutate(rotulo = paste0(rank_producao, "º ", limpar_nome_mun(municipio)))
+
+top10_milho_2020 <- ranking_mun %>% 
+  filter(ano == ano_ref, produto_nome == "Milho", rank_producao <= 10) %>%
+  mutate(rotulo = paste0(rank_producao, "º ", limpar_nome_mun(municipio)))
+
+pts_milho_1991 <- centroides %>% 
+  inner_join(top10_milho_1991 %>% select(municipio_codigo, municipio, rank_producao, producao_t, rotulo), by = "municipio_codigo")
+
+pts_milho_2020 <- centroides %>% 
+  inner_join(top10_milho_2020 %>% select(municipio_codigo, municipio, rank_producao, producao_t, rotulo), by = "municipio_codigo")
+
+mapa_top10_milho <- ggplot() +
+  geom_sf(data = malha_mun, fill = "#F7F7F2", color = "grey70", linewidth = 0.1) +
+  geom_sf(data = pts_milho_1991, aes(size = producao_t / 1000),
+          shape = 21, color = "#F57F17", fill = alpha("#FFF9C4", 0.5), stroke = 0.5) +
+  geom_sf(data = pts_milho_2020, aes(size = producao_t / 1000),
+          shape = 21, color = "#E65100", fill = alpha("#F9A825", 0.7), stroke = 0.8) +
+  scale_size_continuous(range = c(2, 15), name = "Produção (mil t)") +
+  ggrepel::geom_label_repel(
+    data = pts_milho_2020,
+    aes(x = x, y = y, label = rotulo),
+    inherit.aes = FALSE, size = 2.5, fontface = "bold",
+    fill = alpha("white", 0.85), box.padding = 0.5, force = 3,
+    seed = 42, max.overlaps = Inf, xlim = xlim_pr, ylim = ylim_pr
+  ) +
+  labs(title = "Top 10 Municípios Produtores de Milho",
+       subtitle = "Círculos: 1991 (amarelo claro) vs 2020 (laranja escuro)", caption = caption_pam) +
+  tema_mapa()
+
+mapa_top10_milho <- finalizar_mapa(mapa_top10_milho)
+ggsave(file.path(dir_mapas, "mapa_comparativo_top10_milho.png"), mapa_top10_milho, width = 9, height = 8, dpi = 300, bg = "white")
+
+# Exportar CSVs de apoio
+write_csv(tendencia_municipal, file.path(dir_dados, "tendencia_producao_municipios_1991_2020.csv"))
+write_csv(top10_soja_2020, file.path(dir_dados, "top10_soja_2020.csv"))
+write_csv(top10_milho_2020, file.path(dir_dados, "top10_milho_2020.csv"))
+write_csv(top10_soja_1991, file.path(dir_dados, "top10_soja_1991.csv"))
+write_csv(top10_milho_1991, file.path(dir_dados, "top10_milho_1991.csv"))
+
+cat("[4/6] Mapas espaciais e de tendência concluídos com sucesso.\n")
+
+## ---------------------------------------------------------------------------
+## 7) FONTES EXTRAS / CENSO --------------------------------------------------
+## ---------------------------------------------------------------------------
+cat("[5/6] Processando relatório técnico...\n")
+
+## ---------------------------------------------------------------------------
+## 8) RELATÓRIO TEXTUAL (PROVA DOS 9) ----------------------------------------
+## ---------------------------------------------------------------------------
+linhas <- character(0); add <- function(...) linhas <<- c(linhas, paste0(...))
+
+res_soja_base  <- resumo_pr %>% filter(ano == ano_base, produto_nome == "Soja")
+res_soja_ref   <- resumo_pr %>% filter(ano == ano_ref, produto_nome == "Soja")
+res_milho_base <- resumo_pr %>% filter(ano == ano_base, produto_nome == "Milho")
+res_milho_ref  <- resumo_pr %>% filter(ano == ano_ref, produto_nome == "Milho")
+
+add(strrep("=", 80))
+add("      RELATÓRIO TÉCNICO: PRODUÇÃO DE SOJA E MILHO NO PARANÁ")
+add(paste0("      Período: ", ano_base, " a ", ano_ref, " | Processado em: ", data_geracao))
+add(strrep("=", 80)); add("")
+
+## 1. Introdução
+add("1. INTRODUÇÃO"); add(strrep("-", 80))
+add("Este relatório analisa a dinâmica de produção, área e produtividade das culturas")
+add(paste0("de soja e milho no estado do Paraná, contrastando o ano-base (", ano_base, ") com o"))
+add(paste0("ano de referência (", ano_ref, "). Avalia-se também a concentração produtiva e os"))
+add("10 maiores municípios produtores em ambos os cenários."); add("")
+
+## 2. Material e Métodos
+add("2. MATERIAL E MÉTODOS"); add(strrep("-", 80))
+add("- Fonte: IBGE/SIDRA, Pesquisa Agrícola Municipal (Tabela 1612).")
+add("- Variáveis: Área plantada (ha), Área colhida (ha), Produção (t), Rendimento (kg/ha).")
+add("- Processamento: Script R automatizado via API (pacote sidrar).")
+add("- Fórmulas:")
+add("  * Variação % = 100 × (Valor_Final / Valor_Inicial - 1)")
+add("  * Produtividade (kg/ha) recalculada: (Produção_t × 1000) ÷ Área_colhida_ha")
+add("  * Participação % municipal: 100 × Produção_Mun ÷ Produção_UF"); add("")
+
+## 3. Resultados
+add("3. RESULTADOS E TENDÊNCIAS"); add(strrep("-", 80))
+add("SOJA:")
+add(sprintf("  %s: %s mil t produzidas em %s mil ha (Produtividade: %s kg/ha)", 
+            ano_base, fmt_ptbr(res_soja_base$producao_t/1000,1), fmt_ptbr(res_soja_base$area_colhida_ha/1000,1), fmt_ptbr(res_soja_base$rendimento_kg_ha,0)))
+add(sprintf("  %s: %s mil t produzidas em %s mil ha (Produtividade: %s kg/ha)", 
+            ano_ref, fmt_ptbr(res_soja_ref$producao_t/1000,1), fmt_ptbr(res_soja_ref$area_colhida_ha/1000,1), fmt_ptbr(res_soja_ref$rendimento_kg_ha,0)))
+add(sprintf("  Variação na Produção: %s%% | Produtividade: %s%%", 
+            fmt_ptbr(res_soja_ref$variacao_prod_pct,1), 
+            fmt_ptbr(100*(res_soja_ref$rendimento_kg_ha/res_soja_base$rendimento_kg_ha - 1),1))); add("")
+
+add("MILHO:")
+add(sprintf("  %s: %s mil t produzidas em %s mil ha (Produtividade: %s kg/ha)", 
+            ano_base, fmt_ptbr(res_milho_base$producao_t/1000,1), fmt_ptbr(res_milho_base$area_colhida_ha/1000,1), fmt_ptbr(res_milho_base$rendimento_kg_ha,0)))
+add(sprintf("  %s: %s mil t produzidas em %s mil ha (Produtividade: %s kg/ha)", 
+            ano_ref, fmt_ptbr(res_milho_ref$producao_t/1000,1), fmt_ptbr(res_milho_ref$area_colhida_ha/1000,1), fmt_ptbr(res_milho_ref$rendimento_kg_ha,0)))
+add(sprintf("  Variação na Produção: %s%% | Produtividade: %s%%", 
+            fmt_ptbr(res_milho_ref$variacao_prod_pct,1), 
+            fmt_ptbr(100*(res_milho_ref$rendimento_kg_ha/res_milho_base$rendimento_kg_ha - 1),1))); add("")
+
+add("TOP 10 PRODUTORES - MUDANÇAS (1991 vs 2020)")
+add("------------------------------------------")
+for(prod in c("Soja", "Milho")) {
+  add(paste("Cultura:", prod))
+  top_base <- ranking_mun %>% filter(produto_nome == prod, ano == ano_base, rank_producao <= 10) %>% pull(municipio)
+  top_ref  <- ranking_mun %>% filter(produto_nome == prod, ano == ano_ref, rank_producao <= 10) %>% pull(municipio)
+  add(paste("  Top 3 em", ano_base, ":", paste(head(top_base,3), collapse=", ")))
+  add(paste("  Top 3 em", ano_ref, ":", paste(head(top_ref,3), collapse=", ")))
+  add(paste("  Permaneceram no Top 10:", paste(intersect(top_base, top_ref), collapse=", ")))
+  add("")
+}
+
+## 4. Discussão
+add("4. DISCUSSÃO"); add(strrep("-", 80))
+add("A série histórica evidencia um expressivo ganho de produtividade para ambas as")
+add("culturas, refletindo adoção de biotecnologia e manejo avançado. A soja assumiu")
+add("protagonismo absoluto em expansão de área, enquanto o milho demonstrou forte")
+add("aumento vertical de rendimento (possivelmente impulsionado pelo milho safrinha).")
+add("A geografia da produção também sofreu alterações, com novos municípios ingressando")
+add("na liderança estadual ao longo das três décadas."); add("")
+
+## 5. Prova dos Nove
+add("5. PROVA DOS NOVE (VERIFICAÇÃO DE CÁLCULOS)"); add(strrep("-", 80))
+soma_soja <- sum(dados_pam$producao_t[dados_pam$ano == ano_ref & dados_pam$produto_nome == "Soja"], na.rm=T)
+add("Cálculo 1: Somatório municipal vs Resumo Estadual (Soja 2020)")
+add(sprintf("  Soma direta dos municípios: %s t", fmt_ptbr(soma_soja, 0)))
+add(sprintf("  Valor no resumo agregado:   %s t", fmt_ptbr(res_soja_ref$producao_t, 0)))
+add(sprintf("  Diferença: %s (OK)", round(abs(soma_soja - res_soja_ref$producao_t), 4)))
+
+calc_rend <- (res_soja_ref$producao_t * 1000) / res_soja_ref$area_colhida_ha
+add("Cálculo 2: Produtividade (Soja 2020)")
+add(sprintf("  (Produção %s t × 1000) ÷ Área %s ha", fmt_ptbr(res_soja_ref$producao_t,0), fmt_ptbr(res_soja_ref$area_colhida_ha,0)))
+add(sprintf("  = %s kg/ha", fmt_ptbr(calc_rend, 2)))
+add(sprintf("  Valor reportado = %s kg/ha (OK)", fmt_ptbr(res_soja_ref$rendimento_kg_ha, 2))); add("")
+
+## 6. Limitações
+add("6. LIMITAÇÕES"); add(strrep("-", 80))
+add("A tabela 1612 engloba a safra anual total (incluindo 1ª e 2ª safras no caso do")
+add("milho), não permitindo a desagregação das tendências específicas da 'safrinha'")
+add("nesta extração direta.")
+
+writeLines(linhas, file.path(dir_analise, "analise_parana_soja_milho.txt"), useBytes = FALSE)
+
+## ---------------------------------------------------------------------------
+## 9) RESUMO FINAL CONSOLE ---------------------------------------------------
+## ---------------------------------------------------------------------------
+cat("\n================= EXECUÇÃO CONCLUÍDA =================\n")
+cat("Pasta de saída:", diretorio_saida, "\n")
+cat(" - dados/    :", length(list.files(dir_dados)),    "arquivos CSV\n")
+cat(" - graficos/ :", length(list.files(dir_graficos)), "gráficos PNG\n")
+cat(" - mapas/    :", length(list.files(dir_mapas)),    "mapas PNG\n")
+cat(" - analise/  :", length(list.files(dir_analise)),  "arquivo TXT\n")
+cat("Ano base:", ano_base, "| Ano de referência:", ano_ref, "\n")

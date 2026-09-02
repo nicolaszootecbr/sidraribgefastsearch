@@ -1,0 +1,290 @@
+# ============================================================
+# Análise de Banheiros por Domicílio - VERSÃO ROBUSTA
+# Com cache, retry e fallback para mapas
+# ============================================================
+
+library(sidrar)
+library(tidyverse)
+library(geobr)
+library(sf)
+library(ggplot2)
+library(scales)
+library(janitor)
+
+if (requireNamespace("conflicted", quietly = TRUE)) {
+  conflicted::conflicts_prefer(dplyr::filter)
+}
+
+# ============================================================
+# FUNÇÕES AUXILIARES PARA MAPAS
+# ============================================================
+
+# Função para baixar mapa com retry e cache
+obter_mapa_com_cache <- function(nivel = "estado", codigo = NULL, ano = 2020, max_tentativas = 3) {
+  # Criar diretório de cache
+  dir.create("cache_geobr", showWarnings = FALSE)
+  
+  # Nome do arquivo de cache
+  nome_cache <- file.path("cache_geobr", paste0(nivel, "_", codigo %||% "all", "_", ano, ".rds"))
+  
+  # Verificar cache
+  if (file.exists(nome_cache)) {
+    message("Carregando mapa do cache: ", nome_cache)
+    return(readRDS(nome_cache))
+  }
+  
+  # Tentar baixar com retry
+  for (tentativa in 1:max_tentativas) {
+    message("Tentativa ", tentativa, " de ", max_tentativas, " para baixar mapa...")
+    
+    mapa <- tryCatch({
+      if (nivel == "estado") {
+        geobr::read_state(year = ano, showProgress = FALSE)
+      } else if (nivel == "municipio") {
+        geobr::read_municipality(code_muni = codigo, year = ano, showProgress = FALSE)
+      }
+    }, error = function(e) {
+      message("Erro: ", e$message)
+      NULL
+    })
+    
+    if (!is.null(mapa)) {
+      # Salvar no cache
+      saveRDS(mapa, nome_cache)
+      message("Mapa salvo no cache: ", nome_cache)
+      return(mapa)
+    }
+    
+    if (tentativa < max_tentativas) {
+      message("Aguardando ", tentativa * 5, " segundos...")
+      Sys.sleep(tentativa * 5)
+    }
+  }
+  
+  return(NULL)
+}
+
+# Função para calcular centróides
+calcular_centroides <- function(mapa) {
+  mapa %>%
+    mutate(
+      centroide = st_centroid(geom),
+      longitude = st_coordinates(centroide)[,1],
+      latitude = st_coordinates(centroide)[,2]
+    ) %>%
+    st_drop_geometry()
+}
+
+# ============================================================
+# 1. BAIXAR DADOS DO SIDRA
+# ============================================================
+
+message("Baixando dados do SIDRA...")
+
+dados_brutos <- tryCatch(
+  sidrar::get_sidra(
+    x = 9397,
+    variable = 382,
+    period = "2022",
+    geo = "State",
+    classific = "c458",
+    category = list(c("72117", "12032", "12033", "12034", "72118", "72119", "12046")),
+    header = TRUE
+  ),
+  error = function(e) {
+    message("Erro ao baixar dados: ", e$message)
+    return(NULL)
+  }
+)
+
+if (is.null(dados_brutos) || nrow(dados_brutos) == 0) {
+  stop("Sem dados")
+}
+
+# --- 2. LIMPEZA ---
+dados_limpos <- dados_brutos %>%
+  janitor::clean_names() %>%
+  mutate(
+    cod_uf = str_pad(as.character(unidade_da_federacao_codigo), width = 2, pad = "0"),
+    nome_uf = unidade_da_federacao,
+    categoria = existencia_de_banheiro_ou_sanitario_e_numero_de_banheiros_de_uso_exclusivo_do_domicilio,
+    valor = as.numeric(valor)
+  ) %>%
+  select(cod_uf, nome_uf, categoria, valor)
+
+# --- 3. TABELA WIDE ---
+tabela_wide <- dados_limpos %>%
+  pivot_wider(
+    id_cols = c(cod_uf, nome_uf),
+    names_from = categoria,
+    values_from = valor,
+    values_fill = 0
+  ) %>%
+  janitor::clean_names()
+
+# --- 4. CALCULAR MÉTRICAS ---
+col_total <- names(tabela_wide)[str_detect(names(tabela_wide), "^total$")]
+col_2banheiros <- names(tabela_wide)[str_detect(names(tabela_wide), "2_banheiros")]
+col_sem_banheiro <- names(tabela_wide)[str_detect(names(tabela_wide), "nao_tinham")]
+
+tabela_final <- tabela_wide %>%
+  mutate(
+    total_pessoas = !!sym(col_total[1]),
+    pessoas_2mais = !!sym(col_2banheiros[1]),
+    pessoas_sem_banheiro = !!sym(col_sem_banheiro[1]),
+    proporcao_2mais = ifelse(total_pessoas > 0,
+                             pessoas_2mais / total_pessoas * 100,
+                             NA_real_),
+    proporcao_sem_banheiro = ifelse(total_pessoas > 0,
+                                    pessoas_sem_banheiro / total_pessoas * 100,
+                                    NA_real_)
+  ) %>%
+  select(cod_uf, nome_uf, total_pessoas, pessoas_2mais, pessoas_sem_banheiro,
+         proporcao_2mais, proporcao_sem_banheiro) %>%
+  arrange(desc(proporcao_2mais))
+
+# --- 5. GRÁFICO DE BARRAS (CORRIGIDO) ---
+# Criar diretório
+dir.create("resultados_banheiros_uf", showWarnings = FALSE)
+
+# Gráfico com todos os estados
+grafico_barras <- ggplot(tabela_final, 
+                         aes(x = reorder(nome_uf, proporcao_2mais),
+                             y = proporcao_2mais,
+                             fill = proporcao_2mais)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis_c(option = "viridis", direction = -1) +
+  labs(title = "Domicílios com 2+ Banheiros por UF (%)",
+       subtitle = "Censo 2022",
+       x = "Unidade da Federação",
+       y = "% de Domicílios com 2+ Banheiros") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none")
+
+ggsave("resultados_banheiros_uf/grafico_barras.png", grafico_barras,
+       width = 10, height = 8, dpi = 300)
+
+# --- 6. MAPA COROPLÉTICO ---
+message("Obtendo mapa dos estados...")
+
+mapa_br <- obter_mapa_com_cache("estado", ano = 2020)
+
+if (!is.null(mapa_br)) {
+  # Juntar dados
+  mapa_dados <- mapa_br %>%
+    mutate(code_state = as.character(code_state)) %>%
+    left_join(tabela_final, by = c("code_state" = "cod_uf"))
+  
+  # Mapa coroplético
+  mapa_coropletico <- ggplot(mapa_dados) +
+    geom_sf(aes(fill = proporcao_2mais), color = "white", linewidth = 0.2) +
+    scale_fill_viridis_c(option = "viridis", direction = -1,
+                         name = "% 2+ Banheiros",
+                         labels = scales::percent_format(scale = 1)) +
+    labs(title = "Domicílios com 2+ Banheiros por UF",
+         subtitle = "Censo 2022",
+         caption = "Fonte: IBGE/SIDRA") +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5),
+          legend.position = "right")
+  
+  ggsave("resultados_banheiros_uf/mapa_coropletico.png", mapa_coropletico,
+         width = 10, height = 8, dpi = 300)
+  
+  # --- 7. MAPA COM CENTRÓIDES ---
+  message("Calculando centróides...")
+  
+  # Calcular centróides
+  centroides <- calcular_centroides(mapa_br)
+  
+  # Top 10 estados
+  top10 <- tabela_final %>% slice_head(n = 10)
+  
+  # Juntar com centróides
+  top10_centroides <- top10 %>%
+    left_join(centroides %>% select(code_state, name_state, longitude, latitude),
+              by = c("cod_uf" = "code_state"))
+  
+  # Mapa base
+  mapa_base <- ggplot(mapa_br) +
+    geom_sf(fill = "grey95", color = "grey70", linewidth = 0.2) +
+    theme_void()
+  
+  # Adicionar pontos e rótulos
+  mapa_centroides <- mapa_base +
+    geom_point(data = top10_centroides,
+               aes(x = longitude, y = latitude, size = proporcao_2mais),
+               color = "darkblue", alpha = 0.7) +
+    geom_text(data = top10_centroides,
+              aes(x = longitude, y = latitude, 
+                  label = paste0(name_state, "\n", round(proporcao_2mais, 1), "%")),
+              hjust = 0.5, vjust = -1, size = 3.5, fontface = "bold") +
+    scale_size_continuous(name = "% 2+ Banheiros",
+                          range = c(3, 10),
+                          labels = scales::percent_format(scale = 1)) +
+    labs(title = "Top 10 Estados - Domicílios com 2+ Banheiros",
+         caption = "Fonte: IBGE/Censo 2022") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "right")
+  
+  ggsave("resultados_banheiros_uf/mapa_centroides.png", mapa_centroides,
+         width = 10, height = 8, dpi = 300)
+  
+  # --- 8. MAPA SEM BANHEIRO ---
+  mapa_sem_banheiro <- ggplot(mapa_dados) +
+    geom_sf(aes(fill = proporcao_sem_banheiro), color = "white", linewidth = 0.2) +
+    scale_fill_viridis_c(option = "magma", direction = -1,
+                         name = "% Sem Banheiro",
+                         labels = scales::percent_format(scale = 1)) +
+    labs(title = "Domicílios sem Banheiro por UF",
+         subtitle = "Censo 2022") +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "right")
+  
+  ggsave("resultados_banheiros_uf/mapa_sem_banheiro.png", mapa_sem_banheiro,
+         width = 10, height = 8, dpi = 300)
+  
+} else {
+  message("Não foi possível obter o mapa. Gerando apenas gráficos e tabelas.")
+}
+
+# --- 9. SALVAR RESULTADOS ---
+write_csv(tabela_final, "resultados_banheiros_uf/analise_banheiros_uf.csv")
+
+# Resumo
+resumo <- tabela_final %>%
+  summarise(
+    media_2mais = mean(proporcao_2mais, na.rm = TRUE),
+    mediana_2mais = median(proporcao_2mais, na.rm = TRUE),
+    max_2mais = max(proporcao_2mais, na.rm = TRUE),
+    min_2mais = min(proporcao_2mais, na.rm = TRUE),
+    media_sem = mean(proporcao_sem_banheiro, na.rm = TRUE),
+    max_sem = max(proporcao_sem_banheiro, na.rm = TRUE)
+  )
+
+write_csv(as_tibble(resumo), "resultados_banheiros_uf/resumo_estatistico.csv")
+
+# Análise textual
+texto <- paste0(
+  "ANÁLISE TEXTUAL - BANHEIROS POR DOMICÍLIO\n\n",
+  "1. Média de domicílios com 2+ banheiros: ", round(resumo$media_2mais, 2), "%\n",
+  "2. Estado com maior proporção: ", tabela_final$nome_uf[1], " (", 
+  round(tabela_final$proporcao_2mais[1], 2), "%)\n",
+  "3. Estado com menor proporção: ", tabela_final$nome_uf[nrow(tabela_final)], " (", 
+  round(tabela_final$proporcao_2mais[nrow(tabela_final)], 2), "%)\n",
+  "4. Média de domicílios sem banheiro: ", round(resumo$media_sem, 2), "%\n",
+  "5. Estado com mais sem banheiro: ", 
+  tabela_final$nome_uf[which.max(tabela_final$proporcao_sem_banheiro)], " (",
+  round(max(tabela_final$proporcao_sem_banheiro), 2), "%)\n"
+)
+
+writeLines(texto, "resultados_banheiros_uf/analise_textual.txt")
+cat("\n", texto)
+
+# --- 10. MENSAGEM FINAL ---
+message("\n=== ARQUIVOS GERADOS ===")
+print(list.files("resultados_banheiros_uf", full.names = TRUE))

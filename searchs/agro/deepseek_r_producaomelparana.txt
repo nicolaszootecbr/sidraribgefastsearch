@@ -1,0 +1,351 @@
+# ============================================================
+# Análise da Produção de Mel no Paraná
+# Fonte: IBGE/SIDRA - Tabela 6935
+# Versão Final Corrigida
+# ============================================================
+
+library(sidrar)
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(scales)
+library(janitor)
+
+if (requireNamespace("conflicted", quietly = TRUE)) {
+  conflicted::conflicts_prefer(dplyr::filter)
+}
+
+# ============================================================
+# 1. PARÂMETROS
+# ============================================================
+
+tabela <- 6935
+variaveis <- c(2242, 2283, 9508, 10053, 10054)
+classificacao <- "c12517"
+categoria <- "113601"
+uf_codigo <- "41"
+periodo <- "2017"
+nivel_geo <- "City"
+
+dir.create("resultados_producao_mel_pr", showWarnings = FALSE)
+
+# ============================================================
+# 2. BAIXAR DADOS
+# ============================================================
+
+message("Baixando dados da tabela 6935...")
+
+dados_brutos <- tryCatch(
+  sidrar::get_sidra(
+    x = tabela,
+    variable = variaveis,
+    period = periodo,
+    geo = nivel_geo,
+    geo.filter = list("State" = uf_codigo),
+    classific = classificacao,
+    category = list(categoria),
+    header = TRUE
+  ),
+  error = function(e) {
+    message("Erro: ", e$message)
+    return(NULL)
+  }
+)
+
+if (is.null(dados_brutos) || nrow(dados_brutos) == 0) {
+  stop("Sem dados")
+}
+
+message("Dados baixados:", nrow(dados_brutos), "linhas")
+
+# ============================================================
+# 3. LIMPEZA
+# ============================================================
+
+dados_limpos <- dados_brutos %>%
+  janitor::clean_names() %>%
+  mutate(
+    cod_municipio = str_pad(as.character(municipio_codigo), width = 7, pad = "0"),
+    nome_municipio = municipio,
+    valor = as.numeric(valor),
+    variavel = as.character(variavel)
+  ) %>%
+  select(cod_municipio, nome_municipio, variavel, valor)
+
+# ============================================================
+# 4. PIVOT WIDER
+# ============================================================
+
+dados_wide <- dados_limpos %>%
+  pivot_wider(
+    id_cols = c(cod_municipio, nome_municipio),
+    names_from = variavel,
+    values_from = valor,
+    values_fill = 0
+  ) %>%
+  janitor::clean_names()
+
+# Renomear colunas
+dados_wide <- dados_wide %>%
+  rename(
+    estab_apicultura = numero_de_estabelecimentos_agropecuarios_com_apicultura,
+    estab_caixas = numero_de_estabelecimentos_agropecuarios_com_caixas_de_colmeias_na_data_de_referencia,
+    num_caixas = numero_de_caixas_de_colmeias_nos_estabelecimentos_agropecuarios,
+    vendedores_mel = numero_de_estabelecimentos_agropecuarios_que_venderam_mel,
+    valor_venda_mel = valor_da_venda_de_mel
+  )
+
+# ============================================================
+# 5. CÁLCULOS
+# ============================================================
+
+tabela_analise <- dados_wide %>%
+  mutate(
+    caixas_por_estabelecimento = ifelse(estab_apicultura > 0,
+                                         num_caixas / estab_apicultura,
+                                         NA_real_),
+    
+    valor_medio_vendedor = ifelse(vendedores_mel > 0,
+                                   valor_venda_mel / vendedores_mel,
+                                   NA_real_),
+    
+    taxa_vendedores = ifelse(estab_apicultura > 0,
+                              vendedores_mel / estab_apicultura * 100,
+                              NA_real_),
+    
+    taxa_nao_vendedores = ifelse(estab_apicultura > 0,
+                                  (estab_apicultura - vendedores_mel) / estab_apicultura * 100,
+                                  NA_real_)
+  ) %>%
+  arrange(desc(valor_venda_mel))
+
+# ============================================================
+# 6. TOP 10
+# ============================================================
+
+top10 <- tabela_analise %>% slice_head(n = 10)
+
+print("=== TOP 10 MAIORES PRODUTORES ===")
+print(top10 %>% select(nome_municipio, num_caixas, valor_venda_mel, vendedores_mel))
+
+# ============================================================
+# 7. RESUMO ESTATÍSTICO
+# ============================================================
+
+resumo <- tabela_analise %>%
+  summarise(
+    total_municipios = n(),
+    total_estabelecimentos = sum(estab_apicultura, na.rm = TRUE),
+    total_caixas = sum(num_caixas, na.rm = TRUE),
+    total_vendedores = sum(vendedores_mel, na.rm = TRUE),
+    valor_total_mel = sum(valor_venda_mel, na.rm = TRUE),
+    
+    media_caixas_estado = mean(num_caixas, na.rm = TRUE),
+    media_caixas_por_estab = mean(caixas_por_estabelecimento, na.rm = TRUE),
+    media_valor_vendedor = mean(valor_medio_vendedor, na.rm = TRUE),
+    
+    taxa_vendedores_estado = sum(vendedores_mel, na.rm = TRUE) / sum(estab_apicultura, na.rm = TRUE) * 100,
+    taxa_nao_vendedores_estado = (sum(estab_apicultura, na.rm = TRUE) - sum(vendedores_mel, na.rm = TRUE)) / sum(estab_apicultura, na.rm = TRUE) * 100
+  )
+
+print("=== RESUMO DO ESTADO ===")
+print(resumo)
+
+write_csv(as_tibble(resumo), "resultados_producao_mel_pr/resumo_estado.csv")
+
+# ============================================================
+# 8. MÉDIAS DOS TOP 10
+# ============================================================
+
+media_top10 <- top10 %>%
+  summarise(
+    media_caixas = mean(num_caixas, na.rm = TRUE),
+    media_valor = mean(valor_venda_mel, na.rm = TRUE),
+    media_vendedores = mean(vendedores_mel, na.rm = TRUE)
+  )
+
+print("=== MÉDIA DOS TOP 10 ===")
+print(media_top10)
+
+# ============================================================
+# 9. GRÁFICOS DE BARRAS
+# ============================================================
+
+# 9.1 Valor bruto da produção
+grafico_valor <- ggplot(top10, 
+                        aes(x = reorder(nome_municipio, valor_venda_mel),
+                            y = valor_venda_mel)) +
+  geom_col(fill = "goldenrod") +
+  coord_flip() +
+  labs(title = "Top 10 - Valor Bruto da Produção de Mel",
+       x = "Município", y = "Valor (Mil Reais)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("resultados_producao_mel_pr/grafico_valor_producao.png", 
+       grafico_valor, width = 10, height = 7, dpi = 300)
+
+# 9.2 Número de caixas
+grafico_caixas <- ggplot(top10, 
+                         aes(x = reorder(nome_municipio, num_caixas),
+                             y = num_caixas)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 10 - Número de Caixas de Colmeias",
+       x = "Município", y = "Número de Caixas") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("resultados_producao_mel_pr/grafico_num_caixas.png", 
+       grafico_caixas, width = 10, height = 7, dpi = 300)
+
+# 9.3 Vendedores
+grafico_vendedores <- ggplot(top10, 
+                              aes(x = reorder(nome_municipio, vendedores_mel),
+                                  y = vendedores_mel)) +
+  geom_col(fill = "brown") +
+  coord_flip() +
+  labs(title = "Top 10 - Número de Vendedores de Mel",
+       x = "Município", y = "Número de Vendedores") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("resultados_producao_mel_pr/grafico_vendedores.png", 
+       grafico_vendedores, width = 10, height = 7, dpi = 300)
+
+# ============================================================
+# 10. MAPAS
+# ============================================================
+
+message("Obtendo mapa do Paraná...")
+
+# Verificar cache
+if (file.exists("cache_geobr/municipios_pr_2020.rds")) {
+  mapa_pr <- readRDS("cache_geobr/municipios_pr_2020.rds")
+  message("Mapa carregado do cache")
+} else {
+  # Download via FTP do IBGE
+  url_ftp <- "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2020/UFs/PR/PR_Municipios_2020.zip"
+  dir_temp <- tempdir()
+  download.file(url_ftp, file.path(dir_temp, "PR.zip"), mode = "wb", quiet = TRUE)
+  unzip(file.path(dir_temp, "PR.zip"), exdir = dir_temp)
+  shapefile <- list.files(dir_temp, pattern = "\\.shp$", full.names = TRUE)[1]
+  mapa_pr <- st_read(shapefile, quiet = TRUE)
+  
+  # Salvar no cache
+  dir.create("cache_geobr", showWarnings = FALSE)
+  saveRDS(mapa_pr, "cache_geobr/municipios_pr_2020.rds")
+  message("Mapa baixado e salvo no cache")
+}
+
+if (!is.null(mapa_pr)) {
+  
+  # Ajustar código do município
+  if ("CD_MUN" %in% names(mapa_pr)) {
+    mapa_pr <- mapa_pr %>%
+      mutate(cod_municipio = str_pad(as.character(CD_MUN), width = 7, pad = "0"))
+  }
+  
+  # Juntar dados
+  mapa_dados <- mapa_pr %>%
+    left_join(tabela_analise, by = "cod_municipio")
+  
+  # 10.1 Mapa coroplético
+  mapa_coropletico <- ggplot(mapa_dados) +
+    geom_sf(aes(fill = valor_venda_mel), color = "white", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "viridis", direction = -1,
+                         name = "Valor (Mil R$)") +
+    labs(title = "Produção de Mel por Município - Paraná",
+         caption = "Fonte: IBGE/SIDRA (Tabela 6935)") +
+    coord_sf(datum = NA) +
+    theme_void() +
+    theme(plot.margin = margin(10, 10, 10, 10),
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          legend.position = "right")
+  
+  ggsave("resultados_producao_mel_pr/mapa_coropletico.png", 
+         mapa_coropletico, width = 10, height = 9, dpi = 300)
+  
+  # 10.2 Mapa com centróides
+  centroides <- mapa_pr %>%
+    mutate(
+      centroide = st_centroid(geometry),
+      longitude = st_coordinates(centroide)[,1],
+      latitude = st_coordinates(centroide)[,2]
+    ) %>%
+    st_drop_geometry() %>%
+    select(cod_municipio, longitude, latitude)
+  
+  top10_centroides <- top10 %>%
+    left_join(centroides, by = "cod_municipio")
+  
+  mapa_base <- ggplot(mapa_pr) +
+    geom_sf(fill = "grey95", color = "grey70", linewidth = 0.2) +
+    theme_void()
+  
+  mapa_centroides <- mapa_base +
+    geom_point(data = top10_centroides,
+               aes(x = longitude, y = latitude, size = valor_venda_mel),
+               color = "darkorange", alpha = 0.7) +
+    geom_text(data = top10_centroides,
+              aes(x = longitude, y = latitude, 
+                  label = paste0(nome_municipio, "\nR$ ", 
+                                 round(valor_venda_mel, 0), " mil")),
+              hjust = 0.5, vjust = -1, size = 3) +
+    scale_size_continuous(name = "Valor (Mil R$)", range = c(3, 10)) +
+    labs(title = "Top 10 Produtores de Mel - Paraná",
+         caption = "Fonte: IBGE/SIDRA") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "right")
+  
+  ggsave("resultados_producao_mel_pr/mapa_centroides.png", 
+         mapa_centroides, width = 10, height = 9, dpi = 300)
+}
+
+# ============================================================
+# 11. ANÁLISE TEXTUAL
+# ============================================================
+
+texto <- paste0(
+  "ANÁLISE TEXTUAL - PRODUÇÃO DE MEL NO PARANÁ\n\n",
+  "1. Total de municípios com apicultura: ", resumo$total_municipios, "\n",
+  "2. Total de estabelecimentos: ", resumo$total_estabelecimentos, "\n",
+  "3. Total de caixas: ", resumo$total_caixas, "\n",
+  "4. Total de vendedores: ", resumo$total_vendedores, "\n",
+  "5. Valor total: R$ ", round(resumo$valor_total_mel, 2), " mil\n\n",
+  
+  "6. Média de caixas por estabelecimento: ", round(resumo$media_caixas_por_estab, 2), "\n",
+  "7. Valor médio por vendedor: R$ ", round(resumo$media_valor_vendedor, 2), " mil\n",
+  "8. Taxa de vendedores: ", round(resumo$taxa_vendedores_estado, 2), "%\n",
+  "9. Taxa de não vendedores: ", round(resumo$taxa_nao_vendedores_estado, 2), "%\n\n",
+  
+  "TOP 10 MAIORES PRODUTORES:\n"
+)
+
+for (i in 1:nrow(top10)) {
+  texto <- paste0(texto, sprintf(
+    "%d. %s: R$ %s mil (%d caixas, %d vendedores)\n",
+    i, top10$nome_municipio[i],
+    format(round(top10$valor_venda_mel[i], 2), big.mark = "."),
+    top10$num_caixas[i],
+    top10$vendedores_mel[i]
+  ))
+}
+
+writeLines(texto, "resultados_producao_mel_pr/analise_textual.txt")
+cat("\n", texto)
+
+# ============================================================
+# 12. SALVAR TABELAS
+# ============================================================
+
+write_csv(tabela_analise, "resultados_producao_mel_pr/analise_completa.csv")
+write_csv(top10, "resultados_producao_mel_pr/top10_produtores.csv")
+
+# ============================================================
+# 13. MENSAGEM FINAL
+# ============================================================
+
+message("\n=== SUCESSO! ===")
+message("Arquivos gerados na pasta 'resultados_producao_mel_pr':")
+print(list.files("resultados_producao_mel_pr", full.names = TRUE))

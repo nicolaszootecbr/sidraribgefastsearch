@@ -1,0 +1,613 @@
+# ============================================================
+# SISTEMA INTERATIVO DE LOCALIZACOES IBGE - VERSAO ATUALIZADA
+# Com busca de municipio por nome E UF
+# ============================================================
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(cli)
+
+# ============================================================
+# 1. FUNCOES BASICAS DE API
+# ============================================================
+
+api_ibge <- function(url, timeout = 30) {
+  tryCatch({
+    resp <- GET(url, 
+                add_headers("User-Agent" = "R/4.3.2"),
+                timeout(timeout))
+    
+    if (status_code(resp) == 200) {
+      conteudo <- content(resp, as = "text", encoding = "UTF-8")
+      if (nchar(conteudo) > 0) {
+        return(fromJSON(conteudo, simplifyDataFrame = TRUE))
+      }
+      return(NULL)
+    } else {
+      cli::cli_alert_danger(paste("Erro HTTP", status_code(resp)))
+      return(NULL)
+    }
+  }, error = function(e) {
+    cli::cli_alert_danger(paste("Erro:", e$message))
+    return(NULL)
+  })
+}
+
+# ============================================================
+# 2. FUNCOES DE OBTENCAO DE LOCALIZACOES
+# ============================================================
+
+obter_ufs <- function() {
+  dados <- api_ibge("https://servicodados.ibge.gov.br/api/v1/localidades/estados")
+  
+  if (!is.null(dados) && is.data.frame(dados)) {
+    ufs <- dados %>%
+      as_tibble() %>%
+      transmute(
+        cod_uf = as.character(id),
+        sigla_uf = sigla,
+        nome_uf = nome,
+        regiao_nome = regiao$nome
+      ) %>%
+      arrange(nome_uf)
+    
+    return(ufs)
+  }
+  return(NULL)
+}
+
+obter_mesorregioes <- function(cod_uf) {
+  url <- paste0("https://servicodados.ibge.gov.br/api/v1/localidades/estados/", 
+                cod_uf, "/mesorregioes")
+  dados <- api_ibge(url)
+  
+  if (!is.null(dados) && is.data.frame(dados)) {
+    mesos <- dados %>%
+      as_tibble() %>%
+      transmute(
+        cod_meso = as.character(id),
+        nome_meso = nome,
+        cod_uf = as.character(UF$id),
+        sigla_uf = UF$sigla,
+        nome_uf = UF$nome
+      ) %>%
+      arrange(nome_meso)
+    return(mesos)
+  }
+  return(NULL)
+}
+
+obter_microrregioes <- function(cod_meso) {
+  url <- paste0("https://servicodados.ibge.gov.br/api/v1/localidades/mesorregioes/", 
+                cod_meso, "/microrregioes")
+  dados <- api_ibge(url)
+  
+  if (!is.null(dados) && is.data.frame(dados)) {
+    micros <- dados %>%
+      as_tibble() %>%
+      transmute(
+        cod_micro = as.character(id),
+        nome_micro = nome,
+        cod_meso = as.character(mesorregiao$id),
+        nome_meso = mesorregiao$nome,
+        cod_uf = as.character(mesorregiao$UF$id),
+        sigla_uf = mesorregiao$UF$sigla,
+        nome_uf = mesorregiao$UF$nome
+      ) %>%
+      arrange(nome_micro)
+    return(micros)
+  }
+  return(NULL)
+}
+
+obter_municipios <- function(cod_uf = NULL, cod_micro = NULL) {
+  if (!is.null(cod_micro)) {
+    url <- paste0("https://servicodados.ibge.gov.br/api/v1/localidades/microrregioes/", 
+                  cod_micro, "/municipios")
+  } else if (!is.null(cod_uf)) {
+    url <- paste0("https://servicodados.ibge.gov.br/api/v1/localidades/estados/", 
+                  cod_uf, "/municipios")
+  } else {
+    url <- "https://servicodados.ibge.gov.br/api/v1/localidades/municipios"
+  }
+  
+  dados <- api_ibge(url, timeout = 60)
+  
+  if (!is.null(dados) && is.data.frame(dados)) {
+    municipios <- dados %>%
+      as_tibble() %>%
+      transmute(
+        cod_mun = as.character(id),
+        nome_mun = nome,
+        cod_micro = as.character(microrregiao$id),
+        nome_micro = microrregiao$nome,
+        cod_meso = as.character(microrregiao$mesorregiao$id),
+        nome_meso = microrregiao$mesorregiao$nome,
+        cod_uf = as.character(microrregiao$mesorregiao$UF$id),
+        sigla_uf = microrregiao$mesorregiao$UF$sigla,
+        nome_uf = microrregiao$mesorregiao$UF$nome
+      ) %>%
+      arrange(nome_mun)
+    return(municipios)
+  }
+  return(NULL)
+}
+
+obter_distritos <- function(cod_mun) {
+  url <- paste0("https://servicodados.ibge.gov.br/api/v1/localidades/municipios/", 
+                cod_mun, "/distritos")
+  dados <- api_ibge(url)
+  
+  if (!is.null(dados) && is.data.frame(dados)) {
+    distritos <- dados %>%
+      as_tibble() %>%
+      transmute(
+        cod_distrito = as.character(id),
+        nome_distrito = nome,
+        cod_mun = as.character(municipio$id),
+        nome_mun = municipio$nome
+      ) %>%
+      arrange(nome_distrito)
+    return(distritos)
+  }
+  return(NULL)
+}
+
+# ============================================================
+# 3. FUNCOES DE BUSCA MANUAL
+# ============================================================
+
+# Buscar UF por codigo ou nome
+buscar_uf_manual <- function() {
+  cat("\n=== BUSCA MANUAL DE UF ===\n")
+  cat("Digite o codigo (2 digitos), sigla ou nome da UF:\n")
+  entrada <- readline("> ")
+  entrada <- str_trim(toupper(entrada))
+  
+  ufs <- obter_ufs()
+  if (is.null(ufs)) return(NULL)
+  
+  # Buscar por codigo
+  if (grepl("^[0-9]{2}$", entrada)) {
+    resultado <- ufs %>% filter(cod_uf == entrada)
+  } else if (nchar(entrada) == 2) {
+    # Buscar por sigla
+    resultado <- ufs %>% filter(toupper(sigla_uf) == entrada)
+  } else {
+    # Buscar por nome
+    resultado <- ufs %>% 
+      filter(str_detect(toupper(nome_uf), entrada))
+  }
+  
+  if (nrow(resultado) == 0) {
+    cli::cli_alert_danger("UF nao encontrada")
+    return(NULL)
+  }
+  
+  if (nrow(resultado) > 1) {
+    cli::cli_alert_info("Multiplos resultados:")
+    print(resultado %>% select(cod_uf, sigla_uf, nome_uf))
+    indice <- as.integer(readline("Escolha o numero: "))
+    if (is.na(indice) || indice < 1 || indice > nrow(resultado)) return(NULL)
+    resultado <- resultado[indice, ]
+  }
+  
+  cli::cli_alert_success(paste("UF:", resultado$nome_uf[1], "(", resultado$sigla_uf[1], ")"))
+  return(resultado[1, ])
+}
+
+# Buscar municipio por nome E UF (NOVA VERSAO)
+buscar_municipio_manual <- function(uf_selecionada = NULL) {
+  cat("\n=== BUSCA MANUAL DE MUNICIPIO ===\n")
+  
+  # Passo 1: Definir UF
+  cod_uf <- NULL
+  sigla_uf <- NULL
+  
+  if (!is.null(uf_selecionada)) {
+    cat("UF atual:", uf_selecionada, "\n")
+    usar_atual <- readline("Usar esta UF? (s/n): ")
+    
+    if (tolower(usar_atual) %in% c("s", "sim", "y")) {
+      # Usar UF selecionada
+      ufs <- obter_ufs()
+      uf_info <- ufs %>% filter(cod_uf == uf_selecionada | sigla_uf == toupper(uf_selecionada))
+      if (nrow(uf_info) > 0) {
+        cod_uf <- uf_info$cod_uf[1]
+        sigla_uf <- uf_info$sigla_uf[1]
+      }
+    }
+  }
+  
+  if (is.null(cod_uf)) {
+    cat("\nDigite a UF (sigla ou codigo):\n")
+    cat("Exemplos: PR, 41, Parana\n")
+    entrada_uf <- readline("> ")
+    entrada_uf <- str_trim(toupper(entrada_uf))
+    
+    ufs <- obter_ufs()
+    if (is.null(ufs)) return(NULL)
+    
+    if (grepl("^[0-9]{2}$", entrada_uf)) {
+      uf_info <- ufs %>% filter(cod_uf == entrada_uf)
+    } else if (nchar(entrada_uf) == 2) {
+      uf_info <- ufs %>% filter(toupper(sigla_uf) == entrada_uf)
+    } else {
+      uf_info <- ufs %>% filter(str_detect(toupper(nome_uf), entrada_uf))
+    }
+    
+    if (nrow(uf_info) == 0) {
+      cli::cli_alert_danger("UF nao encontrada")
+      return(NULL)
+    }
+    
+    if (nrow(uf_info) > 1) {
+      print(uf_info %>% select(cod_uf, sigla_uf, nome_uf))
+      indice <- as.integer(readline("Escolha: "))
+      if (is.na(indice) || indice < 1 || indice > nrow(uf_info)) return(NULL)
+      uf_info <- uf_info[indice, ]
+    }
+    
+    cod_uf <- uf_info$cod_uf[1]
+    sigla_uf <- uf_info$sigla_uf[1]
+  }
+  
+  # Passo 2: Buscar municipio dentro da UF
+  cat("\nDigite o nome do municipio (ou parte do nome):\n")
+  nome_busca <- readline("> ")
+  nome_busca <- str_trim(toupper(nome_busca))
+  
+  # Obter municipios da UF
+  municipios <- obter_municipios(cod_uf = cod_uf)
+  
+  if (is.null(municipios)) return(NULL)
+  
+  # Buscar por nome
+  resultado <- municipios %>% 
+    filter(str_detect(toupper(nome_mun), nome_busca))
+  
+  if (nrow(resultado) == 0) {
+    cli::cli_alert_danger("Municipio nao encontrado nesta UF")
+    return(NULL)
+  }
+  
+  if (nrow(resultado) > 1) {
+    cli::cli_alert_info(paste("Multiplos resultados:", nrow(resultado)))
+    print(resultado %>% select(cod_mun, nome_mun), n = 20)
+    indice <- as.integer(readline("Escolha o numero: "))
+    if (is.na(indice) || indice < 1 || indice > nrow(resultado)) return(NULL)
+    resultado <- resultado[indice, ]
+  }
+  
+  cli::cli_alert_success(paste("Municipio:", resultado$nome_mun[1], "-", sigla_uf))
+  return(resultado[1, ])
+}
+
+# Buscar mesorregiao por nome E UF
+buscar_mesorregiao_manual <- function(uf_selecionada = NULL) {
+  cat("\n=== BUSCA MANUAL DE MESORREGIAO ===\n")
+  
+  cod_uf <- NULL
+  
+  if (!is.null(uf_selecionada)) {
+    ufs <- obter_ufs()
+    uf_info <- ufs %>% filter(cod_uf == uf_selecionada | sigla_uf == toupper(uf_selecionada))
+    if (nrow(uf_info) > 0) {
+      cod_uf <- uf_info$cod_uf[1]
+    }
+  }
+  
+  if (is.null(cod_uf)) {
+    cat("Digite a UF (sigla ou codigo): ")
+    entrada_uf <- str_trim(toupper(readline("> ")))
+    
+    ufs <- obter_ufs()
+    if (grepl("^[0-9]{2}$", entrada_uf)) {
+      uf_info <- ufs %>% filter(cod_uf == entrada_uf)
+    } else {
+      uf_info <- ufs %>% filter(toupper(sigla_uf) == entrada_uf)
+    }
+    
+    if (nrow(uf_info) == 0) {
+      cli::cli_alert_danger("UF nao encontrada")
+      return(NULL)
+    }
+    cod_uf <- uf_info$cod_uf[1]
+  }
+  
+  cat("Digite o nome da mesorregiao: ")
+  nome_busca <- str_trim(toupper(readline("> ")))
+  
+  mesos <- obter_mesorregioes(cod_uf)
+  
+  if (is.null(mesos)) return(NULL)
+  
+  resultado <- mesos %>% filter(str_detect(toupper(nome_meso), nome_busca))
+  
+  if (nrow(resultado) == 0) {
+    cli::cli_alert_danger("Mesorregiao nao encontrada")
+    return(NULL)
+  }
+  
+  if (nrow(resultado) > 1) {
+    print(resultado %>% select(cod_meso, nome_meso))
+    indice <- as.integer(readline("Escolha: "))
+    resultado <- resultado[indice, ]
+  }
+  
+  cli::cli_alert_success(paste("Mesorregiao:", resultado$nome_meso[1]))
+  return(resultado[1, ])
+}
+
+# ============================================================
+# 4. FUNCAO DE EXPORTACAO
+# ============================================================
+
+exportar_selecao <- function(selecao) {
+  if (is.null(selecao$dados_final)) {
+    cli::cli_alert_warning("Nada para exportar")
+    readline("\nENTER para continuar...")
+    return(invisible(NULL))
+  }
+  
+  cat("\014")
+  cli::cli_h1("EXPORTAR DADOS")
+  
+  formato <- menu(c("CSV", "RDS", "JSON"), title = "Formato:")
+  nome_base <- readline("Nome do arquivo: ")
+  if (nome_base == "") nome_base <- "export"
+  
+  dir.create("export", showWarnings = FALSE)
+  caminho <- file.path("export", nome_base)
+  
+  df <- selecao$dados_final
+  
+  if (formato == 1) write.csv(df, paste0(caminho, ".csv"), row.names = FALSE)
+  if (formato == 2) saveRDS(df, paste0(caminho, ".rds"))
+  if (formato == 3) write_json(df, paste0(caminho, ".json"), pretty = TRUE)
+  
+  cli::cli_alert_success("Exportado!")
+  readline("\nENTER para continuar...")
+}
+
+# ============================================================
+# 5. SISTEMA INTERATIVO
+# ============================================================
+
+sistema_navegacao_localidades <- function() {
+  
+  selecao <- list(
+    nivel = NULL,
+    cod_uf = NULL, nome_uf = NULL, sigla_uf = NULL,
+    cod_meso = NULL, nome_meso = NULL,
+    cod_micro = NULL, nome_micro = NULL,
+    cod_mun = NULL, nome_mun = NULL,
+    dados_final = NULL
+  )
+  
+  while(TRUE) {
+    cat("\014")
+    cli::cli_h1("SISTEMA DE NAVEGACAO DE LOCALIZACOES IBGE")
+    cli::cli_rule()
+    
+    if (!is.null(selecao$nivel)) {
+      cli::cli_h2("SELECAO ATUAL")
+      cli::cli_text("Nivel:", selecao$nivel)
+      if (!is.null(selecao$nome_uf)) cli::cli_text("UF:", selecao$nome_uf, "(", selecao$sigla_uf, ")")
+      if (!is.null(selecao$nome_meso)) cli::cli_text("Mesorregiao:", selecao$nome_meso)
+      if (!is.null(selecao$nome_micro)) cli::cli_text("Microrregiao:", selecao$nome_micro)
+      if (!is.null(selecao$nome_mun)) cli::cli_text("Municipio:", selecao$nome_mun)
+      cli::cli_rule()
+    }
+    
+    opcoes <- c(
+      "Listar/Selecionar UFs",
+      "BUSCA MANUAL de UF",
+      "Ver Mesorregioes da UF",
+      "BUSCA MANUAL de Mesorregiao",
+      "Ver Microrregioes",
+      "Ver Municipios da Microrregiao",
+      "Ver todos Municipios da UF",
+      "BUSCA MANUAL de Municipio (nome + UF)",
+      "Ver Distritos",
+      "Exportar selecao",
+      "Limpar selecao",
+      "Sair"
+    )
+    
+    escolha <- menu(opcoes, title = "Escolha:")
+    
+    if (escolha == length(opcoes)) break
+    
+    switch(escolha,
+      # 1. Listar UFs
+      {
+        ufs <- obter_ufs()
+        if (!is.null(ufs)) {
+          print(ufs %>% select(cod_uf, sigla_uf, nome_uf), n = 27)
+          indice <- as.integer(readline("\nNumero da UF: "))
+          if (!is.na(indice) && indice >= 1 && indice <= nrow(ufs)) {
+            selecao$cod_uf <- ufs$cod_uf[indice]
+            selecao$nome_uf <- ufs$nome_uf[indice]
+            selecao$sigla_uf <- ufs$sigla_uf[indice]
+            selecao$nivel <- "UF"
+            selecao$dados_final <- ufs
+          }
+        }
+        readline("\nENTER...")
+      },
+      
+      # 2. BUSCA MANUAL UF
+      {
+        resultado <- buscar_uf_manual()
+        if (!is.null(resultado)) {
+          selecao$cod_uf <- resultado$cod_uf[1]
+          selecao$nome_uf <- resultado$nome_uf[1]
+          selecao$sigla_uf <- resultado$sigla_uf[1]
+          selecao$nivel <- "UF"
+          selecao$dados_final <- resultado
+        }
+        readline("\nENTER...")
+      },
+      
+      # 3. Mesorregioes
+      {
+        if (is.null(selecao$cod_uf)) {
+          cli::cli_alert_warning("Selecione uma UF primeiro")
+        } else {
+          mesos <- obter_mesorregioes(selecao$cod_uf)
+          if (!is.null(mesos)) {
+            print(mesos %>% select(cod_meso, nome_meso), n = 100)
+            indice <- as.integer(readline("\nNumero: "))
+            if (!is.na(indice) && indice >= 1 && indice <= nrow(mesos)) {
+              selecao$cod_meso <- mesos$cod_meso[indice]
+              selecao$nome_meso <- mesos$nome_meso[indice]
+              selecao$nivel <- "Mesorregiao"
+              selecao$dados_final <- mesos
+            }
+          }
+        }
+        readline("\nENTER...")
+      },
+      
+      # 4. BUSCA MANUAL Mesorregiao
+      {
+        resultado <- buscar_mesorregiao_manual(selecao$cod_uf)
+        if (!is.null(resultado)) {
+          selecao$cod_meso <- resultado$cod_meso[1]
+          selecao$nome_meso <- resultado$nome_meso[1]
+          selecao$nivel <- "Mesorregiao"
+          selecao$dados_final <- resultado
+        }
+        readline("\nENTER...")
+      },
+      
+      # 5. Microrregioes
+      {
+        if (is.null(selecao$cod_meso)) {
+          cli::cli_alert_warning("Selecione uma mesorregiao primeiro")
+        } else {
+          micros <- obter_microrregioes(selecao$cod_meso)
+          if (!is.null(micros)) {
+            print(micros %>% select(cod_micro, nome_micro), n = 100)
+            indice <- as.integer(readline("\nNumero: "))
+            if (!is.na(indice) && indice >= 1 && indice <= nrow(micros)) {
+              selecao$cod_micro <- micros$cod_micro[indice]
+              selecao$nome_micro <- micros$nome_micro[indice]
+              selecao$nivel <- "Microrregiao"
+              selecao$dados_final <- micros
+            }
+          }
+        }
+        readline("\nENTER...")
+      },
+      
+      # 6. Municipios da Microrregiao
+      {
+        if (is.null(selecao$cod_micro)) {
+          cli::cli_alert_warning("Selecione uma microrregiao primeiro")
+        } else {
+          municipios <- obter_municipios(cod_micro = selecao$cod_micro)
+          if (!is.null(municipios)) {
+            selecao$dados_final <- municipios
+            print(municipios %>% select(cod_mun, nome_mun), n = 100)
+            indice <- as.integer(readline("\nNumero: "))
+            if (!is.na(indice) && indice >= 1 && indice <= nrow(municipios)) {
+              selecao$cod_mun <- municipios$cod_mun[indice]
+              selecao$nome_mun <- municipios$nome_mun[indice]
+              selecao$nivel <- "Municipio"
+            }
+          }
+        }
+        readline("\nENTER...")
+      },
+      
+      # 7. Todos Municipios da UF
+      {
+        if (is.null(selecao$cod_uf)) {
+          cli::cli_alert_warning("Selecione uma UF primeiro")
+        } else {
+          municipios <- obter_municipios(cod_uf = selecao$cod_uf)
+          if (!is.null(municipios)) {
+            selecao$dados_final <- municipios
+            print(municipios %>% select(cod_mun, nome_mun), n = 50)
+            cli::cli_alert_success(paste("Total:", nrow(municipios)))
+          }
+        }
+        readline("\nENTER...")
+      },
+      
+      # 8. BUSCA MANUAL Municipio (nome + UF)
+      {
+        resultado <- buscar_municipio_manual(selecao$cod_uf)
+        if (!is.null(resultado)) {
+          selecao$cod_mun <- resultado$cod_mun[1]
+          selecao$nome_mun <- resultado$nome_mun[1]
+          selecao$cod_uf <- resultado$cod_uf[1]
+          selecao$sigla_uf <- resultado$sigla_uf[1]
+          selecao$nome_uf <- resultado$nome_uf[1]
+          selecao$nivel <- "Municipio"
+          selecao$dados_final <- resultado
+        }
+        readline("\nENTER...")
+      },
+      
+      # 9. Distritos
+      {
+        if (is.null(selecao$cod_mun)) {
+          cli::cli_alert_warning("Selecione um municipio primeiro")
+        } else {
+          distritos <- obter_distritos(selecao$cod_mun)
+          if (!is.null(distritos)) {
+            selecao$dados_final <- distritos
+            print(distritos %>% select(cod_distrito, nome_distrito), n = 100)
+          }
+        }
+        readline("\nENTER...")
+      },
+      
+      # 10. Exportar
+      {
+        exportar_selecao(selecao)
+      },
+      
+      # 11. Limpar
+      {
+        selecao <- list(
+          nivel = NULL, cod_uf = NULL, nome_uf = NULL, sigla_uf = NULL,
+          cod_meso = NULL, nome_meso = NULL, cod_micro = NULL,
+          nome_micro = NULL, cod_mun = NULL, nome_mun = NULL,
+          dados_final = NULL
+        )
+        cli::cli_alert_success("Selecao limpa")
+        readline("\nENTER...")
+      }
+    )
+  }
+  
+  return(selecao)
+}
+
+# ============================================================
+# 6. EXECUCAO
+# ============================================================
+
+cat("\014")
+cli::cli_h1("SISTEMA DE NAVEGACAO DE LOCALIZACOES IBGE")
+cli::cli_text("Iniciando...")
+cli::cli_rule()
+
+selecao_final <- sistema_navegacao_localidades()
+
+if (!is.null(selecao_final$nivel)) {
+  cli::cli_h1("RESUMO FINAL")
+  cli::cli_text("Nivel:", selecao_final$nivel)
+  if (!is.null(selecao_final$nome_uf)) cli::cli_text("UF:", selecao_final$nome_uf, "(", selecao_final$sigla_uf, ")")
+  if (!is.null(selecao_final$nome_meso)) cli::cli_text("Mesorregiao:", selecao_final$nome_meso)
+  if (!is.null(selecao_final$nome_micro)) cli::cli_text("Microrregiao:", selecao_final$nome_micro)
+  if (!is.null(selecao_final$nome_mun)) cli::cli_text("Municipio:", selecao_final$nome_mun)
+}

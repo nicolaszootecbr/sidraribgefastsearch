@@ -1,0 +1,530 @@
+# ============================================================
+# SISTEMA DE DIAGNÓSTICO SIDRA - VERSÃO FINAL
+# Aproveita catálogo enriquecido já baixado
+# ============================================================
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(stringi)
+library(cli)
+
+# ============================================================
+# 1. FUNÇÕES UTILITÁRIAS
+# ============================================================
+
+normalizar_texto <- function(texto) {
+  texto %>%
+    tolower() %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%
+    str_replace_all("[[:punct:]]", " ") %>%
+    str_squish()
+}
+
+buscar_palavra_inteira <- function(texto, padrao) {
+  str_detect(texto, paste0("\\b", padrao, "\\b"))
+}
+
+criar_padrao_busca <- function(termo) {
+  termo_norm <- normalizar_texto(termo)
+  
+  padrao <- case_when(
+    # Culturas
+    str_detect(termo_norm, "cafe") ~ "cafe|cafeeiro|arabica|conilon",
+    str_detect(termo_norm, "milho") ~ "milho",
+    str_detect(termo_norm, "soja") ~ "soja",
+    str_detect(termo_norm, "feij") ~ "feijao|feijoes",
+    str_detect(termo_norm, "arroz") ~ "arroz",
+    str_detect(termo_norm, "trigo") ~ "trigo",
+    str_detect(termo_norm, "cana") ~ "cana",
+    str_detect(termo_norm, "algod") ~ "algodao",
+    str_detect(termo_norm, "mandioca") ~ "mandioca|macaxeira",
+    str_detect(termo_norm, "laranja") ~ "laranja|citrus",
+    str_detect(termo_norm, "banana") ~ "banana",
+    str_detect(termo_norm, "uva") ~ "uva|videira",
+    str_detect(termo_norm, "batata") ~ "batata",
+    str_detect(termo_norm, "tomate") ~ "tomate",
+    str_detect(termo_norm, "cebola") ~ "cebola",
+    str_detect(termo_norm, "alho") ~ "alho",
+    str_detect(termo_norm, "cacau") ~ "cacau",
+    str_detect(termo_norm, "coco") ~ "coco",
+    str_detect(termo_norm, "manga") ~ "manga",
+    
+    # Espécies
+    str_detect(termo_norm, "bovino|gado|vaca|boi") ~ "bovino|gado|vaca|boi",
+    str_detect(termo_norm, "suino|porco") ~ "suino|porco",
+    str_detect(termo_norm, "ovino|ovelha") ~ "ovino|ovelha",
+    str_detect(termo_norm, "caprino|cabra") ~ "caprino|cabra",
+    str_detect(termo_norm, "equino|cavalo") ~ "equino|cavalo",
+    str_detect(termo_norm, "bubalino|bufalo") ~ "bubalino|bufalo",
+    str_detect(termo_norm, "aves|galinha|frango") ~ "aves|galinha|frango",
+    str_detect(termo_norm, "abelha|mel") ~ "abelha|mel|apicultura",
+    str_detect(termo_norm, "coelho") ~ "coelho",
+    str_detect(termo_norm, "peixe|pescado") ~ "peixe|pescado|aquicultura",
+    
+    # Temas sociais
+    str_detect(termo_norm, "renda|salario") ~ "renda|rendimento|salario",
+    str_detect(termo_norm, "educa|escolar|alfabet") ~ "educa|escolar|alfabet",
+    str_detect(termo_norm, "internet") ~ "internet|digital",
+    str_detect(termo_norm, "saneamento|esgoto|agua") ~ "saneamento|esgoto|agua",
+    str_detect(termo_norm, "moradia|domicilio|habitac") ~ "moradia|domicilio|habitac",
+    str_detect(termo_norm, "trabalho|emprego|ocupac") ~ "trabalho|emprego|ocupac",
+    str_detect(termo_norm, "saude|hospital") ~ "saude|hospital",
+    str_detect(termo_norm, "populac|demogra") ~ "populac|demogra|habitante",
+    
+    TRUE ~ termo_norm
+  )
+  
+  return(padrao)
+}
+
+# ============================================================
+# 2. FUNÇÕES DE CARREGAMENTO (SEM DOWNLOAD)
+# ============================================================
+
+carregar_catalogo_base <- function(arquivo = "catalogo_sidra_completo.rds") {
+  if (!file.exists(arquivo)) {
+    stop("Arquivo não encontrado: ", arquivo)
+  }
+  
+  cat("Carregando catálogo base de:", arquivo, "\n")
+  catalogo <- readRDS(arquivo)
+  cat("Catálogo base:", nrow(catalogo$tabelas), "tabelas\n")
+  return(catalogo)
+}
+
+carregar_catalogo_enriquecido <- function(arquivo = "catalogo_sidra_enriquecido.rds") {
+  if (!file.exists(arquivo)) {
+    cat("Arquivo enriquecido não encontrado:", arquivo, "\n")
+    cat("Execute o script de enriquecimento primeiro.\n")
+    return(NULL)
+  }
+  
+  cat("Carregando catálogo enriquecido de:", arquivo, "\n")
+  catalogo_enriquecido <- readRDS(arquivo)
+  cat("Catálogo enriquecido:", length(catalogo_enriquecido$metadados), "tabelas\n")
+  return(catalogo_enriquecido)
+}
+
+# ============================================================
+# 3. FUNÇÃO DE BUSCA EM CATEGORIAS
+# ============================================================
+
+buscar_em_categorias <- function(catalogo_enriquecido, termo) {
+  if (is.null(catalogo_enriquecido)) {
+    return(data.frame())
+  }
+  
+  termo_norm <- normalizar_texto(termo)
+  resultados <- list()
+  
+  for (tabela_id in names(catalogo_enriquecido$metadados)) {
+    categorias <- catalogo_enriquecido$metadados[[tabela_id]]
+    
+    if (is.null(categorias) || length(categorias) == 0) next
+    
+    for (nome_class in names(categorias)) {
+      cats <- categorias[[nome_class]]
+      
+      if (is.null(cats) || length(cats) == 0) next
+      
+      cats_norm <- normalizar_texto(cats)
+      
+      if (any(str_detect(cats_norm, termo_norm))) {
+        tabela_info <- catalogo_enriquecido$tabelas %>%
+          filter(tabela_id == !!tabela_id) %>%
+          select(pesquisa_id, pesquisa_nome, tabela_id, tabela_nome)
+        
+        if (nrow(tabela_info) > 0) {
+          resultados[[paste(tabela_id, nome_class)]] <- data.frame(
+            pesquisa_id = tabela_info$pesquisa_id[1],
+            pesquisa_nome = tabela_info$pesquisa_nome[1],
+            tabela_id = tabela_id,
+            tabela_nome = tabela_info$tabela_nome[1],
+            classificacao = nome_class,
+            categorias_encontradas = paste(
+              cats[str_detect(cats_norm, termo_norm)], 
+              collapse = "; "
+            ),
+            stringsAsFactors = FALSE
+          )
+        }
+      }
+    }
+  }
+  
+  if (length(resultados) > 0) {
+    return(bind_rows(resultados))
+  }
+  return(data.frame())
+}
+
+# ============================================================
+# 4. FUNÇÃO DE BUSCA COMPLETA
+# ============================================================
+
+buscar_produto_completo <- function(catalogo, catalogo_enriquecido, termo) {
+  cli::cli_h2(paste("BUSCA COMPLETA PARA:", termo))
+  
+  # 1. Busca no nome
+  resultados_nome <- catalogo$tabelas %>%
+    filter(str_detect(normalizar_texto(tabela_nome), criar_padrao_busca(termo))) %>%
+    select(pesquisa_id, pesquisa_nome, tabela_id, tabela_nome)
+  
+  cli::cli_h3("RESULTADOS NO NOME DA TABELA")
+  if (nrow(resultados_nome) > 0) {
+    print(as_tibble(resultados_nome))
+  } else {
+    cli::cli_alert_warning("Nenhum resultado no nome")
+  }
+  
+  # 2. Busca nas categorias
+  cli::cli_h3("RESULTADOS NAS CATEGORIAS")
+  resultados_categorias <- buscar_em_categorias(catalogo_enriquecido, termo)
+  
+  if (nrow(resultados_categorias) > 0) {
+    print(as_tibble(resultados_categorias))
+  } else {
+    cli::cli_alert_warning("Nenhum resultado nas categorias")
+  }
+  
+  return(list(
+    no_nome = resultados_nome,
+    nas_categorias = resultados_categorias
+  ))
+}
+
+# ============================================================
+# 5. FUNÇÃO DE EXPORTAÇÃO
+# ============================================================
+
+exportar_dados <- function(dados, nome_arquivo, formato = "csv") {
+  dir.create("diagnosticos", showWarnings = FALSE)
+  caminho <- file.path("diagnosticos", nome_arquivo)
+  
+  if (formato == "csv") {
+    write.csv(dados, paste0(caminho, ".csv"), row.names = FALSE, fileEncoding = "UTF-8")
+    cli::cli_alert_success(paste("Exportado:", paste0(caminho, ".csv")))
+  } else if (formato == "rds") {
+    saveRDS(dados, paste0(caminho, ".rds"))
+    cli::cli_alert_success(paste("Exportado:", paste0(caminho, ".rds")))
+  }
+}
+
+# ============================================================
+# 6. RELATÓRIO HTML
+# ============================================================
+
+gerar_relatorio_html <- function(catalogo, resultados_lista, arquivo = "diagnostico.html") {
+  linhas <- c(
+    "<html><head><meta charset='UTF-8'><title>Diagnóstico SIDRA</title></head><body>",
+    "<h1>Diagnóstico do Catálogo SIDRA</h1>",
+    paste0("<p>Gerado em: ", Sys.time(), "</p>"),
+    paste0("<p>Total de tabelas: ", nrow(catalogo$tabelas), "</p>")
+  )
+  
+  for (nome in names(resultados_lista)) {
+    linhas <- c(linhas, paste0("<h2>", nome, "</h2>"))
+    if (!is.null(resultados_lista[[nome]]) && nrow(resultados_lista[[nome]]) > 0) {
+      linhas <- c(linhas, "<table border='1'><tr>",
+                  paste0("<th>", names(resultados_lista[[nome]]), "</th>", collapse = ""),
+                  "</tr>")
+      for (i in 1:min(nrow(resultados_lista[[nome]]), 50)) {
+        linhas <- c(linhas, "<tr>",
+                    paste0("<td>", resultados_lista[[nome]][i, ], "</td>", collapse = ""),
+                    "</tr>")
+      }
+      linhas <- c(linhas, "</table><br>")
+    }
+  }
+  
+  linhas <- c(linhas, "</body></html>")
+  writeLines(linhas, arquivo)
+  cli::cli_alert_success(paste("Relatório gerado:", arquivo))
+}
+
+# ============================================================
+# 7. DIAGNÓSTICO PRINCIPAL
+# ============================================================
+
+diagnostico_completo <- function(catalogo, catalogo_enriquecido = NULL) {
+  if (is.null(catalogo) || is.null(catalogo$tabelas)) {
+    stop("Catálogo inválido")
+  }
+  
+  resultados_para_relatorio <- list()
+  
+  cat("\014")
+  cli::cli_h1("DIAGNÓSTICO SIDRA - VERSÃO ENRIQUECIDA")
+  cli::cli_rule()
+  
+  while(TRUE) {
+    cli::cli_h2("OPÇÕES DE DIAGNÓSTICO")
+    
+    opcoes <- c(
+      "Resumo geral",
+      "Distribuição por pesquisa",
+      "Cobertura por tema",
+      "Cobertura por espécie",
+      "Cobertura por cultura (NOME)",
+      "Cobertura por cultura (CATEGORIAS)",
+      "Cobertura social",
+      "Busca completa (nome + categorias)",
+      "Ver níveis de uma tabela",
+      "Exportar catálogo",
+      "Gerar relatório HTML",
+      "Sair"
+    )
+    
+    escolha <- menu(opcoes, title = "Escolha:")
+    if (escolha == length(opcoes)) break
+    
+    switch(escolha,
+      # 1. Resumo geral
+      {
+        cli::cli_h2("RESUMO GERAL")
+        resumo <- catalogo$tabelas %>%
+          group_by(pesquisa_id, pesquisa_nome) %>%
+          summarise(total = n(), .groups = "drop") %>%
+          arrange(desc(total))
+        print(as_tibble(resumo), n = 20)
+        resultados_para_relatorio$resumo <- resumo
+      },
+      
+      # 2. Distribuição
+      {
+        cli::cli_h2("DISTRIBUIÇÃO POR PESQUISA")
+        dist <- catalogo$tabelas %>%
+          group_by(pesquisa_id, pesquisa_nome) %>%
+          summarise(
+            total = n(),
+            percentual = round(n()/nrow(catalogo$tabelas)*100, 2),
+            .groups = "drop"
+          ) %>%
+          arrange(desc(total))
+        print(as_tibble(dist), n = 20)
+        resultados_para_relatorio$distribuicao <- dist
+      },
+      
+      # 3. Cobertura por tema
+      {
+        cli::cli_h2("COBERTURA POR TEMA")
+        
+        temas <- c(
+          "Agricultura" = "agricultura|lavoura|cultura|plantio",
+          "Pecuária" = "pecuaria|rebanho|animal|gado",
+          "Renda" = "renda|rendimento|salario",
+          "Educação" = "educacao|escolar|alfabetizacao",
+          "Saúde" = "saude|hospital|medico",
+          "Trabalho" = "trabalho|emprego|ocupacao",
+          "Habitação" = "habitacao|moradia|domicilio",
+          "Saneamento" = "saneamento|esgoto|agua",
+          "Internet" = "internet|digital",
+          "População" = "populacao|demografia|habitante"
+        )
+        
+        cobertura <- map_df(names(temas), function(tema) {
+          total <- catalogo$tabelas %>%
+            filter(str_detect(normalizar_texto(tabela_nome), temas[tema])) %>%
+            nrow()
+          data.frame(tema = tema, total_tabelas = total)
+        }) %>% arrange(desc(total_tabelas))
+        
+        print(as_tibble(cobertura))
+        resultados_para_relatorio$temas <- cobertura
+      },
+      
+      # 4. Cobertura por espécie
+      {
+        cli::cli_h2("COBERTURA POR ESPÉCIE ANIMAL")
+        
+        especies <- c(
+          "Bovinos" = "bovino|gado|vaca|boi",
+          "Suínos" = "suino|porco",
+          "Ovinos" = "ovino|ovelha",
+          "Caprinos" = "caprino|cabra",
+          "Equinos" = "equino|cavalo",
+          "Bubalinos" = "bubalino|bufalo",
+          "Aves" = "aves|galinha|frango",
+          "Abelhas" = "abelha|mel",
+          "Peixes" = "peixe|pescado"
+        )
+        
+        cobertura_esp <- map_df(names(especies), function(esp) {
+          total <- catalogo$tabelas %>%
+            filter(str_detect(normalizar_texto(tabela_nome), especies[esp])) %>%
+            nrow()
+          data.frame(especie = esp, total_tabelas = total)
+        }) %>% arrange(desc(total_tabelas))
+        
+        print(as_tibble(cobertura_esp))
+        resultados_para_relatorio$especies <- cobertura_esp
+      },
+      
+      # 5. Cobertura por cultura (NOME)
+      {
+        cli::cli_h2("COBERTURA POR CULTURA (NOME)")
+        
+        culturas <- c(
+          "Milho" = "milho", "Soja" = "soja", "Feijão" = "feijao",
+          "Arroz" = "arroz", "Trigo" = "trigo", "Café" = "cafe",
+          "Cana" = "cana", "Algodão" = "algodao", "Mandioca" = "mandioca",
+          "Laranja" = "laranja", "Banana" = "banana", "Uva" = "uva",
+          "Batata" = "batata", "Tomate" = "tomate", "Cebola" = "cebola",
+          "Alho" = "alho", "Cacau" = "cacau", "Coco" = "coco", "Manga" = "manga"
+        )
+        
+        cobertura_nome <- map_df(names(culturas), function(cult) {
+          total <- catalogo$tabelas %>%
+            filter(buscar_palavra_inteira(normalizar_texto(tabela_nome), culturas[[cult]])) %>%
+            nrow()
+          data.frame(cultura = cult, total_tabelas = total)
+        }) %>% arrange(desc(total_tabelas))
+        
+        print(as_tibble(cobertura_nome), n = 20)
+        resultados_para_relatorio$culturas_nome <- cobertura_nome
+      },
+      
+      # 6. Cobertura por cultura (CATEGORIAS)
+      {
+        cli::cli_h2("COBERTURA POR CULTURA (CATEGORIAS)")
+        
+        if (is.null(catalogo_enriquecido)) {
+          cli::cli_alert_warning("Catálogo enriquecido não disponível")
+        } else {
+          culturas <- c(
+            "Milho", "Soja", "Feijão", "Arroz", "Trigo",
+            "Café", "Cana", "Algodão", "Mandioca",
+            "Laranja", "Banana", "Uva", "Batata", "Tomate",
+            "Cebola", "Alho", "Cacau", "Coco", "Manga"
+          )
+          
+          cobertura_cat <- map_df(culturas, function(cultura) {
+            termo_norm <- normalizar_texto(cultura)
+            
+            no_nome <- catalogo$tabelas %>%
+              filter(str_detect(normalizar_texto(tabela_nome), termo_norm)) %>%
+              nrow()
+            
+            nas_categorias <- buscar_em_categorias(catalogo_enriquecido, termo_norm) %>%
+              nrow()
+            
+            data.frame(
+              cultura = cultura,
+              no_nome = no_nome,
+              nas_categorias = nas_categorias,
+              total = no_nome + nas_categorias,
+              stringsAsFactors = FALSE
+            )
+          }) %>% arrange(desc(total))
+          
+          print(as_tibble(cobertura_cat), n = 20)
+          resultados_para_relatorio$culturas_categorias <- cobertura_cat
+        }
+      },
+      
+      # 7. Cobertura social
+      {
+        cli::cli_h2("COBERTURA SOCIAL")
+        
+        temas_sociais <- c(
+          "Renda" = "renda|rendimento",
+          "Alfabetização" = "alfabetizacao|escolaridade",
+          "Internet" = "internet",
+          "Saneamento" = "saneamento|esgoto",
+          "Moradia" = "domicilio|habitacao",
+          "Trabalho" = "trabalho|ocupacao",
+          "Saúde" = "saude|hospital",
+          "Educação" = "educacao|escola"
+        )
+        
+        cobertura_soc <- map_df(names(temas_sociais), function(tema) {
+          total <- catalogo$tabelas %>%
+            filter(pesquisa_id == "CD") %>%
+            filter(str_detect(normalizar_texto(tabela_nome), temas_sociais[tema])) %>%
+            nrow()
+          data.frame(tema = tema, no_censo_demografico = total)
+        }) %>% arrange(desc(no_censo_demografico))
+        
+        print(as_tibble(cobertura_soc))
+        resultados_para_relatorio$social <- cobertura_soc
+      },
+      
+      # 8. Busca completa
+      {
+        cli::cli_h2("BUSCA COMPLETA")
+        
+        if (is.null(catalogo_enriquecido)) {
+          cli::cli_alert_warning("Catálogo enriquecido não disponível")
+        } else {
+          termo <- readline("Termo para busca: ")
+          buscar_produto_completo(catalogo, catalogo_enriquecido, termo)
+        }
+      },
+      
+      # 9. Ver níveis
+      {
+        cli::cli_h2("VER NÍVEIS DE TABELA")
+        
+        tabela_id <- readline("Código da tabela: ")
+        
+        if (requireNamespace("sidrar", quietly = TRUE)) {
+          info <- tryCatch(
+            sidrar::info_sidra(tabela_id),
+            error = function(e) NULL
+          )
+          
+          if (!is.null(info) && !is.null(info$nivel)) {
+            print(info$nivel)
+          } else {
+            cli::cli_alert_warning("Não foi possível obter níveis")
+          }
+        }
+      },
+      
+      # 10. Exportar
+      {
+        cli::cli_h2("EXPORTAR")
+        
+        formato <- menu(c("CSV", "RDS"), title = "Formato:")
+        formato_str <- c("csv", "rds")[formato]
+        nome_base <- readline("Nome do arquivo: ")
+        
+        exportar_dados(catalogo$tabelas, nome_base, formato_str)
+      },
+      
+      # 11. Relatório HTML
+      {
+        cli::cli_h2("GERAR RELATÓRIO")
+        gerar_relatorio_html(catalogo, resultados_para_relatorio)
+      }
+    )
+    
+    cli::cli_rule()
+    readline("Pressione ENTER para continuar...")
+  }
+}
+
+# ============================================================
+# 8. EXECUÇÃO PRINCIPAL (SEM DOWNLOAD)
+# ============================================================
+
+cat("========================================\n")
+cat("CARREGANDO CATÁLOGOS SALVOS\n")
+cat("========================================\n\n")
+
+# Carregar catálogo base
+catalogo <- carregar_catalogo_base()
+
+# Carregar catálogo enriquecido (se existir)
+catalogo_enriquecido <- carregar_catalogo_enriquecido()
+
+cat("\n========================================\n")
+cat("INICIANDO DIAGNÓSTICO\n")
+cat("========================================\n\n")
+
+# Executar diagnóstico
+diagnostico_completo(catalogo, catalogo_enriquecido)

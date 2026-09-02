@@ -1,0 +1,169 @@
+# ============================================================
+# PESO MÉDIO COM RENDIMENTO DE CARCAÇA
+# ============================================================
+
+library(sidrar)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(janitor)
+
+dir.create("resultados_peso_medio_bahia", showWarnings = FALSE)
+
+# ============================================================
+# 1. BAIXAR DADOS
+# ============================================================
+
+dados_brutos <- sidrar::get_sidra(
+  x = 1092,
+  variable = c(284, 285),
+  period = "202001-202604",
+  geo = "State",
+  geo.filter = list("State" = "29"),
+  classific = "c18",
+  category = list("992"),
+  header = TRUE
+)
+
+# ============================================================
+# 2. PROCESSAR
+# ============================================================
+
+dados_limpos <- dados_brutos %>%
+  janitor::clean_names() %>%
+  mutate(
+    valor = as.numeric(valor),
+    ano = as.integer(substr(trimestre_codigo, 1, 4)),
+    trimestre_num = as.integer(substr(trimestre_codigo, 5, 6)),
+    data = as.Date(paste0(ano, "-", (trimestre_num - 1) * 3 + 1, "-01"))
+  )
+
+dados_animais <- dados_limpos %>%
+  filter(str_detect(variavel, "Animais")) %>%
+  select(data, trimestre_codigo, animais = valor)
+
+dados_peso <- dados_limpos %>%
+  filter(str_detect(variavel, "Peso")) %>%
+  select(data, trimestre_codigo, peso_carcaca_kg = valor)
+
+# ============================================================
+# 3. CALCULAR PESO MÉDIO COM RENDIMENTO
+# ============================================================
+
+# Rendimentos típicos de carcaça no Brasil
+RENDIMENTO_CARCACA <- 0.50  # 50% (média nacional)
+
+peso_medio <- dados_animais %>%
+  left_join(dados_peso, by = c("data", "trimestre_codigo")) %>%
+  mutate(
+    # Peso médio da CARCAÇA
+    peso_carcaca_medio_kg = peso_carcaca_kg / animais,
+    peso_carcaca_medio_arroba = peso_carcaca_medio_kg / 15,
+    
+    # Peso VIVO estimado (usando rendimento)
+    peso_vivo_medio_kg = peso_carcaca_medio_kg / RENDIMENTO_CARCACA,
+    peso_vivo_medio_arroba = peso_vivo_medio_kg / 15,
+    
+    # Peso vivo estimado (rendimento 48%)
+    peso_vivo_48_kg = peso_carcaca_medio_kg / 0.48,
+    
+    # Peso vivo estimado (rendimento 52%)
+    peso_vivo_52_kg = peso_carcaca_medio_kg / 0.52
+  ) %>%
+  arrange(data)
+
+# ============================================================
+# 4. RESUMO
+# ============================================================
+
+resumo <- peso_medio %>%
+  summarise(
+    # Carcaça
+    media_carcaca_kg = mean(peso_carcaca_medio_kg, na.rm = TRUE),
+    media_carcaca_arroba = mean(peso_carcaca_medio_arroba, na.rm = TRUE),
+    
+    # Peso vivo (50%)
+    media_peso_vivo_kg = mean(peso_vivo_medio_kg, na.rm = TRUE),
+    media_peso_vivo_arroba = mean(peso_vivo_medio_arroba, na.rm = TRUE),
+    
+    # Faixa de peso vivo (48-52%)
+    min_peso_vivo_kg = mean(peso_vivo_48_kg, na.rm = TRUE),
+    max_peso_vivo_kg = mean(peso_vivo_52_kg, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+cat("\n=== RESUMO COMPLETO ===\n")
+cat("Peso médio da CARCAÇA:", round(resumo$media_carcaca_kg, 1), "kg (",
+    round(resumo$media_carcaca_arroba, 1), "@)\n")
+cat("Peso VIVO estimado (50% rendimento):", round(resumo$media_peso_vivo_kg, 1), "kg (",
+    round(resumo$media_peso_vivo_arroba, 1), "@)\n")
+cat("Faixa de peso vivo (48-52%):", round(resumo$min_peso_vivo_kg, 1), "-", 
+    round(resumo$max_peso_vivo_kg, 1), "kg\n")
+
+# ============================================================
+# 5. GRÁFICO COMPARATIVO
+# ============================================================
+
+# Preparar dados para gráfico
+dados_grafico <- peso_medio %>%
+  select(data, 
+         `Peso Carcaça` = peso_carcaca_medio_kg,
+         `Peso Vivo (50%)` = peso_vivo_medio_kg,
+         `Peso Vivo (48%)` = peso_vivo_48_kg,
+         `Peso Vivo (52%)` = peso_vivo_52_kg) %>%
+  pivot_longer(-data, names_to = "Tipo", values_to = "Peso")
+
+grafico <- ggplot(dados_grafico, aes(x = data, y = Peso, color = Tipo)) +
+  geom_line(linewidth = 1.2) +
+  labs(title = "Peso Médio dos Bovinos Abatidos na Bahia",
+       subtitle = "Comparação: Carcaça vs Peso Vivo (2020-2026)",
+       x = "Data",
+       y = "Peso (kg)") +
+  scale_color_manual(values = c(
+    "Peso Carcaça" = "darkred",
+    "Peso Vivo (50%)" = "darkgreen",
+    "Peso Vivo (48%)" = "orange",
+    "Peso Vivo (52%)" = "blue"
+  )) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave("resultados_peso_medio_bahia/comparacao_peso_vivo.png",
+       grafico, width = 12, height = 7, dpi = 300)
+
+# ============================================================
+# 6. ANÁLISE TEXTUAL
+# ============================================================
+
+texto <- paste0(
+  "ANÁLISE - PESO MÉDIO DOS BOVINOS ABATIDOS NA BAHIA\n",
+  "PERÍODO: 2020-2026\n\n",
+  
+  "PESO MÉDIO DA CARCAÇA:\n",
+  "  ", round(resumo$media_carcaca_kg, 1), " kg\n",
+  "  ", round(resumo$media_carcaca_arroba, 1), " arrobas\n\n",
+  
+  "PESO VIVO ESTIMADO (50% de rendimento):\n",
+  "  ", round(resumo$media_peso_vivo_kg, 1), " kg\n",
+  "  ", round(resumo$media_peso_vivo_arroba, 1), " arrobas\n\n",
+  
+  "FAIXA DE PESO VIVO (48-52% de rendimento):\n",
+  "  ", round(resumo$min_peso_vivo_kg, 1), " - ", 
+  round(resumo$max_peso_vivo_kg, 1), " kg\n\n",
+  
+  "NOTA: O peso médio de 266 kg refere-se à CARCAÇA.\n",
+  "O peso vivo é estimado aplicando o rendimento de carcaça.\n"
+)
+
+writeLines(texto, "resultados_peso_medio_bahia/analise_textual.txt")
+cat("\n", texto)
+
+# ============================================================
+# 7. SALVAR
+# ============================================================
+
+write_csv(peso_medio, "resultados_peso_medio_bahia/peso_medio_completo.csv")
+
+message("\n=== SUCESSO! ===")
+print(list.files("resultados_peso_medio_bahia", full.names = TRUE))

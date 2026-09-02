@@ -1,0 +1,640 @@
+# ============================================================
+# SISTEMA DE BUSCA SIDRA/IBGE - VERSÃO COMPLETA FINAL
+# Com todas as funções necessárias
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(stringi)
+library(cli)
+
+# ============================================================
+# FUNÇÕES UTILITÁRIAS
+# ============================================================
+
+normalizar_texto <- function(texto) {
+  texto %>%
+    tolower() %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%
+    str_replace_all("[[:punct:]]", " ") %>%
+    str_squish()
+}
+
+selecionar_opcao <- function(opcoes, titulo = "Escolha:") {
+  escolha <- menu(opcoes, title = titulo)
+  if (escolha == length(opcoes) && length(opcoes) > 1) {
+    return(readline("Digite o valor: "))
+  }
+  return(opcoes[escolha])
+}
+
+criar_padrao_busca <- function(termo) {
+  termo_norm <- normalizar_texto(termo)
+  
+  padrao <- case_when(
+    str_detect(termo_norm, "cafe") ~ "cafe|cafeeiro|arabica|conilon|robusta",
+    str_detect(termo_norm, "milho") ~ "milho",
+    str_detect(termo_norm, "soja") ~ "soja",
+    str_detect(termo_norm, "feij") ~ "feijao|feijoes",
+    str_detect(termo_norm, "arroz") ~ "arroz",
+    str_detect(termo_norm, "trigo") ~ "trigo",
+    str_detect(termo_norm, "cana") ~ "cana",
+    str_detect(termo_norm, "algod") ~ "algodao|algodoeiro",
+    str_detect(termo_norm, "mandioca") ~ "mandioca|macaxeira|aipim",
+    str_detect(termo_norm, "laranja") ~ "laranja|citrus|citrico",
+    str_detect(termo_norm, "banana") ~ "banana",
+    str_detect(termo_norm, "uva") ~ "uva|vinha|videira",
+    str_detect(termo_norm, "batata") ~ "batata",
+    str_detect(termo_norm, "tomate") ~ "tomate",
+    str_detect(termo_norm, "cebola") ~ "cebola",
+    str_detect(termo_norm, "alho") ~ "alho",
+    str_detect(termo_norm, "cacau") ~ "cacau|cacaueiro",
+    str_detect(termo_norm, "coco") ~ "coco|coqueiro",
+    str_detect(termo_norm, "manga") ~ "manga|mangueira",
+    str_detect(termo_norm, "bovino|gado|vaca|boi") ~ "bovino|gado|vaca|boi|bovinocultura",
+    str_detect(termo_norm, "suino|porco") ~ "suino|porco|suinocultura",
+    str_detect(termo_norm, "ovino|ovelha") ~ "ovino|ovelha|ovinocultura",
+    str_detect(termo_norm, "caprino|cabra") ~ "caprino|cabra|caprinocultura",
+    str_detect(termo_norm, "equino|cavalo") ~ "equino|cavalo|equideocultura",
+    str_detect(termo_norm, "bubalino|bufalo") ~ "bubalino|bufalo",
+    str_detect(termo_norm, "aves|galinha|frango") ~ "aves|galinha|frango|avicultura",
+    str_detect(termo_norm, "abelha|mel") ~ "abelha|mel|apicultura",
+    str_detect(termo_norm, "coelho") ~ "coelho|cunicultura",
+    str_detect(termo_norm, "codorna") ~ "codorna|coturnicultura",
+    str_detect(termo_norm, "leite") ~ "leite|lacteo",
+    str_detect(termo_norm, "ovos") ~ "ovos",
+    str_detect(termo_norm, "couro") ~ "couro",
+    str_detect(termo_norm, "carne") ~ "carne",
+    str_detect(termo_norm, "renda|rendimento|salario") ~ "renda|rendimento|salario",
+    str_detect(termo_norm, "alfabet|educa|escolar") ~ "alfabet|educa|escolar",
+    str_detect(termo_norm, "internet|digital") ~ "internet|digital|conectividade",
+    str_detect(termo_norm, "saneamento|esgoto|agua") ~ "saneamento|esgoto|agua",
+    str_detect(termo_norm, "moradia|habitac|domicilio") ~ "moradia|habita|domicilio",
+    str_detect(termo_norm, "trabalho|emprego|ocupac") ~ "trabalho|emprego|ocupa",
+    str_detect(termo_norm, "saude|hospital") ~ "saude|hospital|medico",
+    str_detect(termo_norm, "populac|demogra") ~ "populac|demogra|habitante",
+    TRUE ~ termo_norm
+  )
+  
+  return(padrao)
+}
+
+# ============================================================
+# CARREGAR CATÁLOGOS
+# ============================================================
+
+carregar_catalogos <- function() {
+  cat("========================================\n")
+  cat("CARREGANDO CATALOGOS\n")
+  cat("========================================\n\n")
+  
+  catalogo_base <- NULL
+  catalogo_enriquecido <- NULL
+  
+  if (file.exists("catalogo_sidra_completo.rds")) {
+    catalogo_base <- readRDS("catalogo_sidra_completo.rds")
+    cat("Catalogo base:", nrow(catalogo_base$tabelas), "tabelas\n")
+  }
+  
+  if (file.exists("catalogo_sidra_enriquecido.rds")) {
+    catalogo_enriquecido <- readRDS("catalogo_sidra_enriquecido.rds")
+    cat("Catalogo enriquecido:", length(catalogo_enriquecido$metadados), "tabelas\n")
+  }
+  
+  cat("\n")
+  
+  return(list(base = catalogo_base, enriquecido = catalogo_enriquecido))
+}
+
+# ============================================================
+# FUNÇÕES DE APOIO (OBRIGATÓRIAS)
+# ============================================================
+
+obter_detalhes_tabela <- function(tabela_id) {
+  cli::cli_h3(paste("DETALHES DA TABELA", tabela_id))
+  
+  library(httr)
+  library(jsonlite)
+  
+  url <- paste0("https://servicodados.ibge.gov.br/api/v3/agregados/", 
+                tabela_id, "/metadados")
+  
+  resp <- GET(url, timeout(30))
+  
+  if (status_code(resp) == 200) {
+    metadados <- fromJSON(content(resp, as = "text", encoding = "UTF-8"), 
+                          simplifyDataFrame = TRUE)
+    
+    cli::cli_text("Nome: ", metadados$nome)
+    cli::cli_text("Pesquisa: ", metadados$pesquisa)
+    cli::cli_text("Periodicidade: ", metadados$periodicidade$frequencia)
+    
+    cli::cli_h3("Variaveis:")
+    if (!is.null(metadados$variaveis) && nrow(metadados$variaveis) > 0) {
+      for (i in seq_len(nrow(metadados$variaveis))) {
+        cli::cli_text(paste0("  [", metadados$variaveis$id[i], "] ", 
+                             metadados$variaveis$nome[i]))
+      }
+    }
+    
+    cli::cli_h3("Classificacoes:")
+    if (!is.null(metadados$classificacoes) && nrow(metadados$classificacoes) > 0) {
+      for (i in seq_len(nrow(metadados$classificacoes))) {
+        cli::cli_text(paste0("  [", metadados$classificacoes$id[i], "] ", 
+                             metadados$classificacoes$nome[i]))
+      }
+    }
+    
+    return(metadados)
+  }
+  
+  return(NULL)
+}
+
+ver_categorias_tabela <- function(catalogo_enriquecido, tabela_id) {
+  if (is.null(catalogo_enriquecido)) {
+    cli::cli_alert_warning("Catalogo enriquecido nao disponivel")
+    return(NULL)
+  }
+  
+  categorias <- catalogo_enriquecido$metadados[[tabela_id]]
+  
+  if (is.null(categorias) || length(categorias) == 0) {
+    cli::cli_alert_warning(paste("Sem categorias para tabela", tabela_id))
+    return(NULL)
+  }
+  
+  cli::cli_h3(paste("CATEGORIAS DA TABELA", tabela_id))
+  cli::cli_rule()
+  
+  for (nome_class in names(categorias)) {
+    cli::cli_h3(nome_class)
+    cats <- categorias[[nome_class]]
+    
+    for (i in seq_len(min(20, length(cats)))) {
+      cat(sprintf("  %d. %s\n", i, cats[i]))
+    }
+    if (length(cats) > 20) {
+      cat(sprintf("  ... e mais %d categorias\n", length(cats) - 20))
+    }
+    cat("\n")
+  }
+  
+  return(categorias)
+}
+
+testar_tabela_sidrar <- function(tabela_id, nivel_geo = "State", 
+                                  periodo = "last", 
+                                  variavel = NULL,
+                                  classificacao = NULL,
+                                  categoria = NULL) {
+  cli::cli_h3(paste("TESTANDO TABELA", tabela_id, "NO SIDRAR"))
+  
+  library(sidrar)
+  
+  tryCatch({
+    args <- list(
+      x = tabela_id,
+      period = periodo,
+      geo = nivel_geo,
+      header = TRUE
+    )
+    
+    if (!is.null(variavel)) {
+      args$variable <- variavel
+    }
+    
+    if (!is.null(classificacao) && !is.null(categoria)) {
+      args$classific <- classificacao
+      args$category <- list(categoria)
+    }
+    
+    dados <- do.call(get_sidra, args)
+    
+    cli::cli_alert_success(paste("Dados obtidos:", nrow(dados), "linhas"))
+    cli::cli_text("Colunas:", paste(names(dados), collapse = ", "))
+    
+    if (nrow(dados) > 0) {
+      cli::cli_text("Amostra:")
+      print(head(dados, 5))
+    }
+    
+    return(dados)
+  }, error = function(e) {
+    cli::cli_alert_danger(paste("Erro:", e$message))
+    return(NULL)
+  })
+}
+
+buscar_em_categorias <- function(catalogo_enriquecido, termo) {
+  if (is.null(catalogo_enriquecido)) return(data.frame())
+  
+  termo_norm <- normalizar_texto(termo)
+  resultados <- list()
+  
+  for (tabela_id in names(catalogo_enriquecido$metadados)) {
+    categorias <- catalogo_enriquecido$metadados[[tabela_id]]
+    if (is.null(categorias) || length(categorias) == 0) next
+    
+    for (nome_class in names(categorias)) {
+      cats <- categorias[[nome_class]]
+      if (is.null(cats) || length(cats) == 0) next
+      
+      cats_norm <- normalizar_texto(cats)
+      
+      if (any(str_detect(cats_norm, termo_norm))) {
+        tabela_info <- catalogo_enriquecido$tabelas %>%
+          filter(tabela_id == !!tabela_id) %>%
+          select(pesquisa_id, pesquisa_nome, tabela_id, tabela_nome)
+        
+        if (nrow(tabela_info) > 0) {
+          resultados[[paste(tabela_id, nome_class)]] <- data.frame(
+            pesquisa_id = tabela_info$pesquisa_id[1],
+            pesquisa_nome = tabela_info$pesquisa_nome[1],
+            tabela_id = tabela_id,
+            tabela_nome = tabela_info$tabela_nome[1],
+            classificacao = nome_class,
+            categorias_encontradas = paste(
+              cats[str_detect(cats_norm, termo_norm)], 
+              collapse = "; "
+            ),
+            stringsAsFactors = FALSE
+          )
+        }
+      }
+    }
+  }
+  
+  if (length(resultados) > 0) return(bind_rows(resultados))
+  return(data.frame())
+}
+
+buscar_combinado <- function(catalogos, termo, pesquisa_id = NULL) {
+  termo_norm <- normalizar_texto(termo)
+  padrao <- criar_padrao_busca(termo_norm)
+  
+  resultados_nome <- catalogos$base$tabelas %>%
+    filter(str_detect(normalizar_texto(tabela_nome), padrao)) %>%
+    mutate(fonte = "nome")
+  
+  if (!is.null(pesquisa_id)) {
+    resultados_nome <- resultados_nome %>% 
+      filter(pesquisa_id == !!pesquisa_id)
+  }
+  
+  resultados_categorias <- buscar_em_categorias(catalogos$enriquecido, termo_norm) %>%
+    mutate(fonte = "categoria")
+  
+  if (!is.null(pesquisa_id) && nrow(resultados_categorias) > 0) {
+    resultados_categorias <- resultados_categorias %>% 
+      filter(pesquisa_id == !!pesquisa_id)
+  }
+  
+  return(list(
+    no_nome = resultados_nome,
+    nas_categorias = resultados_categorias,
+    total = nrow(resultados_nome) + nrow(resultados_categorias)
+  ))
+}
+
+# ============================================================
+# NOVA FUNÇÃO: BUSCA POR CÓDIGO
+# ============================================================
+
+buscar_por_codigo <- function(catalogos) {
+  cli::cli_h2("BUSCA POR CÓDIGO DA TABELA")
+  cli::cli_text("Digite um ou mais códigos separados por vírgula (ex: 74, 488, 1092)")
+  
+  entrada <- readline("Códigos: ")
+  codigos <- str_split(entrada, ",")[[1]] %>% str_trim()
+  
+  codigos_validos <- codigos[grepl("^[0-9]+$", codigos)]
+  
+  if (length(codigos_validos) == 0) {
+    cli::cli_alert_danger("Nenhum código válido.")
+    return(NULL)
+  }
+  
+  resultados <- catalogos$base$tabelas %>%
+    filter(tabela_id %in% codigos_validos)
+  
+  if (nrow(resultados) == 0) {
+    cli::cli_alert_warning("Nenhuma tabela encontrada.")
+    return(NULL)
+  }
+  
+  cli::cli_alert_success(paste("Tabelas encontradas:", nrow(resultados)))
+  cat("\n")
+  print(as_tibble(resultados %>% select(pesquisa_id, pesquisa_nome, tabela_id, tabela_nome)))
+  
+  cli::cli_rule()
+  cli::cli_h3("SELECIONE UMA OU MAIS TABELAS (por vírgula)")
+  
+  for (i in 1:nrow(resultados)) {
+    cat(sprintf("%d. [%s] %s\n", i, resultados$tabela_id[i], 
+                substr(resultados$tabela_nome[i], 1, 60)))
+  }
+  cat(sprintf("%d. Voltar\n", nrow(resultados) + 1))
+  
+  entrada_sel <- readline("Seleção: ")
+  selecionados <- str_split(entrada_sel, ",")[[1]] %>% str_trim() %>% as.integer()
+  selecionados <- selecionados[!is.na(selecionados)]
+  selecionados <- selecionados[selecionados >= 1 & selecionados <= nrow(resultados)]
+  
+  if (length(selecionados) == 0) {
+    return(resultados)
+  }
+  
+  cli::cli_rule()
+  cli::cli_h3("TABELAS SELECIONADAS:")
+  for (i in selecionados) {
+    cat(sprintf("  [%s] %s\n", resultados$tabela_id[i], 
+                substr(resultados$tabela_nome[i], 1, 70)))
+  }
+  
+  while(TRUE) {
+    cli::cli_rule()
+    cli::cli_h3("ESCOLHA AS AÇÕES (múltiplas por vírgula):")
+    
+    cat("1. Ver detalhes completos (variáveis, classificações)\n")
+    cat("2. Ver categorias da tabela\n")
+    cat("3. Testar no SIDRAR\n")
+    cat("4. Baixar dados da tabela\n")
+    cat("5. Ver informações da pesquisa\n")
+    cat("6. Exportar selecionadas\n")
+    cat("0. Voltar ao menu principal\n")
+    
+    entrada_acao <- readline("Ação: ")
+    acoes_sel <- str_split(entrada_acao, ",")[[1]] %>% str_trim() %>% as.integer()
+    acoes_sel <- acoes_sel[!is.na(acoes_sel)]
+    
+    if (length(acoes_sel) == 0 || 0 %in% acoes_sel) {
+      break
+    }
+    
+    for (i in selecionados) {
+      codigo <- resultados$tabela_id[i]
+      nome_tabela <- resultados$tabela_nome[i]
+      
+      cli::cli_rule()
+      cli::cli_h3(paste("TABELA", codigo, "-", substr(nome_tabela, 1, 50)))
+      
+      for (acao in acoes_sel) {
+        switch(acao,
+               {
+                 cli::cli_h3("DETALHES:")
+                 obter_detalhes_tabela(codigo)
+                 cat("\n")
+               },
+               {
+                 cli::cli_h3("CATEGORIAS:")
+                 ver_categorias_tabela(catalogos$enriquecido, codigo)
+                 cat("\n")
+               },
+               {
+                 cli::cli_h3("TESTE SIDRAR:")
+                 testar_tabela_sidrar(codigo)
+                 cat("\n")
+               },
+               {
+                 cli::cli_h3("BAIXAR DADOS:")
+                 baixar_dados_tabela(codigo)
+                 cat("\n")
+               },
+               {
+                 cli::cli_h3("INFOS DA PESQUISA:")
+                 info <- sidrar::info_sidra(codigo)
+                 cat("Nome:", info$table, "\n")
+                 cat("Períodos:", info$period, "\n")
+                 cat("Níveis geográficos:\n")
+                 print(info$geo)
+                 cat("\n")
+               },
+               {
+                 cli::cli_h3("EXPORTAR:")
+                 nome_arq <- readline("Nome do arquivo (ENTER para pular): ")
+                 if (nome_arq != "") {
+                   dados_export <- resultados[selecionados, ]
+                   write.csv(dados_export, paste0(nome_arq, ".csv"), row.names = FALSE)
+                   cli::cli_alert_success("Exportado!")
+                 }
+               }
+        )
+      }
+    }
+  }
+  
+  readline("\nPressione ENTER para continuar...")
+  return(resultados)
+}
+
+# ============================================================
+# SISTEMA PRINCIPAL
+# ============================================================
+
+sistema_busca_sidra <- function(catalogos) {
+  while(TRUE) {
+    cat("\014")
+    
+    cli::cli_h1("SISTEMA DE BUSCA SIDRA/IBGE")
+    cli::cli_text("Busca integrada: nome + categorias + código")
+    cli::cli_rule()
+    
+    cli::cli_h2("ESCOLHA O TIPO DE PESQUISA")
+    
+    opcoes_principal <- c(
+      "BUSCA POR CÓDIGO DA TABELA (múltiplos por vírgula)",
+      "Censo Agropecuario (Rural)",
+      "Censo Demografico (Urbano/Rural)",
+      "Pesquisa da Pecuaria Municipal",
+      "Pesquisa Agricola Municipal (PAM)",
+      "Pesquisa Mensal/Trimestral do Leite",
+      "Pesquisa de Abate de Animais",
+      "Busca por tema especifico",
+      "Busca direta por termo",
+      "Diagnostico de busca",
+      "Sair"
+    )
+    
+    escolha <- menu(opcoes_principal, title = "Digite o numero da opcao:")
+    
+    if (escolha == length(opcoes_principal)) {
+      cli::cli_alert_success("Saindo do sistema...")
+      break
+    }
+    
+    switch(escolha,
+      buscar_por_codigo(catalogos),
+      buscar_censo_agropecuario(catalogos),
+      buscar_censo_demografico(catalogos$base),
+      buscar_pecuaria_municipal(catalogos$base),
+      buscar_agricultura_municipal(catalogos),
+      buscar_pesquisa_leite(catalogos$base),
+      buscar_abate_animais(catalogos$base),
+      buscar_por_tema_especifico(catalogos$base),
+      buscar_termo_direto(catalogos),
+      diagnosticar_busca(catalogos)
+    )
+    
+    cli::cli_rule()
+    readline("Pressione ENTER para continuar...")
+  }
+}
+
+# ===========================================================
+# ============================================================
+# FUNÇÃO AUXILIAR: BAIXAR DADOS DA TABELA
+# ============================================================
+
+baixar_dados_tabela <- function(tabela_id) {
+  cli::cli_h3(paste("BAIXAR DADOS DA TABELA", tabela_id))
+  
+  recortes <- c("Brasil", "Região", "UF", "Mesorregião", "Microrregião", "Município")
+  recorte <- menu(recortes, title = "Nível geográfico:")
+  niveis <- c("Brazil", "Region", "State", "MesoRegion", "MicroRegion", "City")
+  
+  periodo <- readline("Período (last, ano específico, ou intervalo): ")
+  if (periodo == "") periodo <- "last"
+  
+  tryCatch({
+    dados <- sidrar::get_sidra(
+      x = tabela_id,
+      period = periodo,
+      geo = niveis[recorte],
+      header = TRUE
+    )
+    
+    cli::cli_alert_success(paste("Dados baixados:", nrow(dados), "linhas"))
+    
+    salvar <- readline("Salvar em CSV? (s/n): ")
+    if (tolower(salvar) %in% c("s", "sim", "y")) {
+      nome <- readline("Nome do arquivo: ")
+      write.csv(dados, paste0(nome, ".csv"), row.names = FALSE)
+      cli::cli_alert_success("Salvo!")
+    }
+    
+    return(dados)
+  }, error = function(e) {
+    cli::cli_alert_danger(paste("Erro:", e$message))
+    return(NULL)
+  })
+}
+
+# ============================================================
+# FUNÇÕES DE BUSCA ESPECÍFICAS (FALTANTES)
+# ============================================================
+
+buscar_censo_agropecuario <- function(catalogos) {
+  cli::cli_h2("CENSO AGROPECUARIO")
+  termo <- readline("Termo de busca (ex: leite, bovino, café): ")
+  resultados <- buscar_combinado(catalogos, termo, pesquisa_id = "CA")
+  mostrar_resultados(resultados, termo, catalogos)
+}
+
+buscar_censo_demografico <- function(catalogo_base) {
+  cli::cli_h2("CENSO DEMOGRAFICO")
+  termo <- readline("Termo de busca (ex: renda, internet, moradia): ")
+  resultados <- catalogo_base$tabelas %>%
+    filter(pesquisa_id == "CD") %>%
+    filter(str_detect(normalizar_texto(tabela_nome), normalizar_texto(termo)))
+  print(as_tibble(resultados %>% select(pesquisa_nome, tabela_id, tabela_nome)), n = 20)
+}
+
+buscar_pecuaria_municipal <- function(catalogo_base) {
+  cli::cli_h2("PECUARIA MUNICIPAL")
+  termo <- readline("Termo de busca (ex: bovino, leite, ovino): ")
+  resultados <- catalogo_base$tabelas %>%
+    filter(pesquisa_id == "PP") %>%
+    filter(str_detect(normalizar_texto(tabela_nome), normalizar_texto(termo)))
+  print(as_tibble(resultados %>% select(pesquisa_nome, tabela_id, tabela_nome)), n = 20)
+}
+
+buscar_agricultura_municipal <- function(catalogos) {
+  cli::cli_h2("PESQUISA AGRICOLA MUNICIPAL (PAM)")
+  termo <- readline("Termo de busca (ex: soja, milho, café): ")
+  resultados <- buscar_combinado(catalogos, termo, pesquisa_id = "PAM")
+  mostrar_resultados(resultados, termo, catalogos)
+}
+
+buscar_pesquisa_leite <- function(catalogo_base) {
+  cli::cli_h2("PESQUISA DO LEITE")
+  resultados <- catalogo_base$tabelas %>%
+    filter(pesquisa_id %in% c("PL", "LT")) %>%
+    arrange(tabela_id)
+  print(as_tibble(resultados %>% select(pesquisa_nome, tabela_id, tabela_nome)), n = 20)
+}
+
+buscar_abate_animais <- function(catalogo_base) {
+  cli::cli_h2("PESQUISA DE ABATE")
+  resultados <- catalogo_base$tabelas %>%
+    filter(str_detect(normalizar_texto(pesquisa_nome), "abate"))
+  print(as_tibble(resultados %>% select(pesquisa_nome, tabela_id, tabela_nome)), n = 20)
+}
+
+buscar_por_tema_especifico <- function(catalogo_base) {
+  cli::cli_h2("BUSCA POR TEMA")
+  termo <- readline("Digite o tema: ")
+  resultados <- catalogo_base$tabelas %>%
+    filter(str_detect(normalizar_texto(tabela_nome), normalizar_texto(termo)))
+  print(as_tibble(resultados %>% select(pesquisa_nome, tabela_id, tabela_nome)), n = 20)
+}
+
+buscar_termo_direto <- function(catalogos) {
+  cli::cli_h2("BUSCA DIRETA")
+  termo <- readline("Digite o termo: ")
+  resultados <- buscar_combinado(catalogos, termo)
+  mostrar_resultados(resultados, termo, catalogos)
+}
+
+diagnosticar_busca <- function(catalogos) {
+  cli::cli_h2("DIAGNOSTICO DE BUSCA")
+  termos <- c("Cafe", "Soja", "Milho", "Bovinos", "Leite", "Renda")
+  cat(sprintf("%-15s | %-8s | %-12s | %s\n", "Termo", "Nome", "Categorias", "Total"))
+  cat(paste(rep("-", 55), collapse = ""), "\n")
+  for (t in termos) {
+    r <- buscar_combinado(catalogos, t)
+    cat(sprintf("%-15s | %-8d | %-12d | %d\n", t, nrow(r$no_nome), nrow(r$nas_categorias), r$total))
+  }
+}
+
+# ============================================================
+# FUNÇÃO MOSTRAR RESULTADOS (auxiliar)
+# ============================================================
+
+mostrar_resultados <- function(resultados, termo = "", catalogos = NULL) {
+  total <- nrow(resultados$no_nome) + nrow(resultados$nas_categorias)
+  if (total == 0) {
+    cli::cli_alert_warning("Nenhuma tabela encontrada.")
+    return(invisible(NULL))
+  }
+  
+  cli::cli_alert_success(paste("Encontradas:", total, "tabelas para", termo))
+  
+  if (nrow(resultados$no_nome) > 0) {
+    cat("\n--- No nome ---\n")
+    print(as_tibble(resultados$no_nome %>% select(pesquisa_nome, tabela_id, tabela_nome)), n = 15)
+  }
+  
+  if (nrow(resultados$nas_categorias) > 0) {
+    cat("\n--- Nas categorias ---\n")
+    print(as_tibble(resultados$nas_categorias %>% select(pesquisa_nome, tabela_id, tabela_nome, classificacao)), n = 15)
+  }
+  
+  # Opção de exportar
+  exportar <- readline("\nExportar resultados? (s/n): ")
+  if (tolower(exportar) %in% c("s", "sim", "y")) {
+    nome <- readline("Nome do arquivo: ")
+    dados_export <- bind_rows(
+      resultados$no_nome %>% select(pesquisa_nome, tabela_id, tabela_nome),
+      resultados$nas_categorias %>% select(pesquisa_nome, tabela_id, tabela_nome)
+    ) %>% distinct()
+    write.csv(dados_export, paste0(nome, ".csv"), row.names = FALSE)
+    cli::cli_alert_success("Exportado!")
+  }
+}
+
+# Iniciar
+catalogos <- carregar_catalogos()
+sistema_busca_sidra(catalogos)
